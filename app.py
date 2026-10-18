@@ -251,6 +251,7 @@ class NewsSpecialistAgent:
         self.diagnostics = {
             "Yahoo Finance": "Not queried yet.",
             "Financial Modeling Prep": "Not queried yet.",
+            "Alpha Vantage": "Not queried yet.",
         }
 
     @staticmethod
@@ -261,6 +262,117 @@ class NewsSpecialistAgent:
         except Exception:
             pass
         return key or None
+
+    @staticmethod
+    def _alpha_vantage_api_key() -> str | None:
+        """Read Alpha Vantage key from Streamlit Secrets or environment variables."""
+        key = os.getenv("ALPHAVANTAGE_API_KEY", "").strip() or os.getenv("ALPHA_VANTAGE_API_KEY", "").strip()
+        try:
+            key = (st.secrets.get("ALPHAVANTAGE_API_KEY", "") or st.secrets.get("ALPHA_VANTAGE_API_KEY", "") or key).strip()
+        except Exception:
+            pass
+        return key or None
+
+    def _get_alpha_vantage_news(self, ticker: str) -> tuple[list[dict], str | None]:
+        """Retrieve ticker-filtered news from Alpha Vantage NEWS_SENTIMENT."""
+        api_key = self._alpha_vantage_api_key()
+        if not api_key:
+            message = (
+                "ALPHAVANTAGE_API_KEY is not configured in Streamlit Secrets or the environment. "
+                "Add an Alpha Vantage API key to enable the third news provider."
+            )
+            self.diagnostics["Alpha Vantage"] = message
+            return [], message
+
+        try:
+            response = requests.get(
+                "https://www.alphavantage.co/query",
+                params={
+                    "function": "NEWS_SENTIMENT",
+                    "tickers": ticker,
+                    "sort": "LATEST",
+                    "limit": 50,
+                    "apikey": api_key,
+                },
+                timeout=20,
+            )
+            if response.status_code != 200:
+                message = f"Alpha Vantage NEWS_SENTIMENT returned HTTP {response.status_code}."
+                self.diagnostics["Alpha Vantage"] = message
+                return [], message
+
+            try:
+                payload = response.json()
+            except ValueError:
+                message = "Alpha Vantage NEWS_SENTIMENT returned invalid JSON."
+                self.diagnostics["Alpha Vantage"] = message
+                return [], message
+
+            if not isinstance(payload, dict):
+                message = "Alpha Vantage NEWS_SENTIMENT returned an unexpected response format."
+                self.diagnostics["Alpha Vantage"] = message
+                return [], message
+
+            api_message = payload.get("Note") or payload.get("Information") or payload.get("Error Message")
+            if api_message:
+                # API messages often indicate rate limits, key issues, or plan restrictions.
+                safe_message = " ".join(str(api_message).split())[:500]
+                message = f"Alpha Vantage API message: {safe_message}"
+                self.diagnostics["Alpha Vantage"] = message
+                return [], message
+
+            feed = payload.get("feed", [])
+            if not isinstance(feed, list):
+                message = "Alpha Vantage NEWS_SENTIMENT response did not contain a usable feed list."
+                self.diagnostics["Alpha Vantage"] = message
+                return [], message
+
+            ticker_upper = ticker.upper()
+            rows = []
+            for item in feed:
+                if not isinstance(item, dict):
+                    continue
+                # NEWS_SENTIMENT is requested with a ticker filter; when ticker_sentiment
+                # metadata is present, require an explicit match before using the article.
+                ticker_sentiment = item.get("ticker_sentiment")
+                if isinstance(ticker_sentiment, list) and ticker_sentiment:
+                    mentioned = {
+                        str(entry.get("ticker", "")).upper()
+                        for entry in ticker_sentiment if isinstance(entry, dict)
+                    }
+                    if mentioned and ticker_upper not in mentioned:
+                        continue
+
+                title = str(item.get("title") or "").strip()
+                if not title:
+                    continue
+                rows.append({
+                    "title": title,
+                    "publisher": str(item.get("source") or item.get("source_domain") or ""),
+                    "summary": str(item.get("summary") or ""),
+                    "link": str(item.get("url") or ""),
+                    "published": str(item.get("time_published") or ""),
+                })
+
+            if rows:
+                self.diagnostics["Alpha Vantage"] = f"Retrieved {len(rows)} usable article(s)."
+                return rows[:20], None
+
+            message = "Alpha Vantage returned no usable news articles for this ticker."
+            self.diagnostics["Alpha Vantage"] = message
+            return [], message
+        except requests.Timeout:
+            message = "Alpha Vantage news request timed out after 20 seconds."
+            self.diagnostics["Alpha Vantage"] = message
+            return [], message
+        except requests.RequestException as exc:
+            message = f"Alpha Vantage news request failed ({type(exc).__name__})."
+            self.diagnostics["Alpha Vantage"] = message
+            return [], message
+        except (TypeError, ValueError) as exc:
+            message = f"Alpha Vantage news response could not be parsed ({type(exc).__name__})."
+            self.diagnostics["Alpha Vantage"] = message
+            return [], message
 
     @staticmethod
     def _normalise_fmp_payload(payload, ticker: str) -> list[dict]:
@@ -409,12 +521,20 @@ class NewsSpecialistAgent:
                 rows = fmp_rows
                 self.data_source = "Financial Modeling Prep"
                 self.retrieval_error = None
+                self.diagnostics["Alpha Vantage"] = "Not needed because FMP returned usable articles."
             else:
-                self.data_source = "Unavailable"
-                self.retrieval_error = (
-                    f"Yahoo Finance: {self.diagnostics['Yahoo Finance']} "
-                    f"Financial Modeling Prep: {fmp_error or self.diagnostics['Financial Modeling Prep']}"
-                )
+                alpha_rows, alpha_error = self._get_alpha_vantage_news(ticker)
+                if alpha_rows:
+                    rows = alpha_rows
+                    self.data_source = "Alpha Vantage"
+                    self.retrieval_error = None
+                else:
+                    self.data_source = "Unavailable"
+                    self.retrieval_error = (
+                        f"Yahoo Finance: {self.diagnostics['Yahoo Finance']} "
+                        f"Financial Modeling Prep: {fmp_error or self.diagnostics['Financial Modeling Prep']} "
+                        f"Alpha Vantage: {alpha_error or self.diagnostics['Alpha Vantage']}"
+                    )
 
         return pd.DataFrame(rows, columns=["title", "publisher", "summary", "link", "published"])
 
@@ -743,7 +863,7 @@ with st.sidebar:
     run_button = st.button("Run investment research", type="primary", width="stretch")
     st.divider()
     st.caption("Market/news data is retrieved at run time and may be missing or delayed.")
-    st.caption("For company fundamentals and news fallback, configure FMP_API_KEY in Streamlit Secrets.")
+    st.caption("Configure FMP_API_KEY for company fundamentals/news fallback and ALPHAVANTAGE_API_KEY for the third news provider in Streamlit Secrets.")
 
 if run_button:
     if not ticker or not ticker.replace(".", "").isalnum():
