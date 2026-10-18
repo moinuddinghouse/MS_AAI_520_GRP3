@@ -168,10 +168,12 @@ class EarningsSpecialistAgent:
         # missing rather than estimating or fabricating a value.
         found = any(result.get(key) is not None for key in self.FUNDAMENTAL_KEYS if key != "longName")
         if found:
+            result["_data_source"] = "Financial Modeling Prep"
             result["_retrieval_error"] = None
             if errors:
                 result["_partial_data_note"] = "Some FMP fields/endpoints were unavailable: " + " ".join(errors)
         else:
+            result["_data_source"] = "Unavailable"
             result["_retrieval_error"] = (
                 "Yahoo Finance returned no usable fundamentals and FMP did not return requested metrics. "
                 + " ".join(errors or ["Check your FMP API key, subscription access, and ticker symbol."])
@@ -327,10 +329,15 @@ class NewsSpecialistAgent:
                 continue
             provider = content.get("provider", {}) or {}
             canonical = content.get("canonicalUrl", {}) or {}
+            title = content.get("title") or item.get("title") or ""
+            summary = content.get("summary") or item.get("summary") or item.get("text") or ""
+            # Do not treat empty/malformed payload entries as news evidence.
+            if not str(title).strip():
+                continue
             rows.append({
-                "title": content.get("title") or item.get("title") or "",
+                "title": str(title).strip(),
                 "publisher": provider.get("displayName", "") if isinstance(provider, dict) else item.get("publisher", ""),
-                "summary": content.get("summary") or item.get("summary") or item.get("text") or "",
+                "summary": summary,
                 "link": canonical.get("url", "") if isinstance(canonical, dict) else item.get("link", ""),
                 "published": content.get("pubDate") or item.get("providerPublishTime", ""),
             })
@@ -629,6 +636,7 @@ MEMORY
     result = {
         "ticker": ticker,
         "period": period,
+        "research_run_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "history": history,
         "history_source": history_source,
         "history_retrieval_error": history_retrieval_error,
@@ -691,6 +699,7 @@ if result:
     history = result["history"]
 
     st.subheader(f"Research results: {result['ticker']}")
+    st.caption(f"Research run time (UTC): {result.get('research_run_at_utc', 'Unavailable')} — this is the retrieval/run time, not a guarantee that provider data is real-time.")
     st.caption(f"Historical price source: {result.get('history_source', 'Unknown')}")
     if result.get("history_retrieval_error"):
         with st.expander("Historical-price diagnostic details"):
