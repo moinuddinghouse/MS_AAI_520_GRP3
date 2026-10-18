@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import os
 import json
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -92,6 +95,40 @@ def fetch_market_data(ticker: str) -> dict[str, Any]:
     return {"history": history, "metrics": metrics, "info": info}
 
 
+def fetch_google_news_rss(ticker: str, limit: int = 8) -> list[dict[str, str]]:
+    """Try Google News RSS when Yahoo Finance returns no usable headlines."""
+    query = urllib.parse.quote(f"{ticker} stock company")
+    url = (
+        "https://news.google.com/rss/search?q="
+        f"{query}&hl=en-US&gl=US&ceid=US:en"
+    )
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; InvestmentResearchDemo/1.0)"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=8) as response:
+            xml_data = response.read()
+        root = ET.fromstring(xml_data)
+        items: list[dict[str, str]] = []
+        for item in root.findall("./channel/item")[:limit]:
+            title = item.findtext("title", default="").strip()
+            description = item.findtext("description", default="").strip()
+            link = item.findtext("link", default="").strip()
+            if title:
+                items.append({
+                    "title": title,
+                    "text": description or title,
+                    "category": "news",
+                    "source": "Google News RSS",
+                    "url": link,
+                })
+        return items
+    except Exception:
+        # Network access can be blocked on hosted platforms; keep fallback explicit.
+        return []
+
+
 # ---------- Specialist agents ----------
 class BaseAgent:
     def __init__(self, name: str):
@@ -99,12 +136,8 @@ class BaseAgent:
 
     def _gemini(self, prompt: str) -> str | None:
         """Return a Gemini response when configured; otherwise return None."""
-        try:
-            api_key = st.secrets.get("GOOGLE_API_KEY", "")
-        except Exception:
-            api_key = ""
-        api_key = api_key or os.getenv("GOOGLE_API_KEY", "")
-        if not api_key or ChatGoogleGenerativeAI is None or HumanMessage is None:
+        api_key = st.secrets.get("GOOGLE_API_KEY", os.getenv("GOOGLE_API_KEY", ""))
+        if not api_key or ChatGoogleGenerativeAI is None:
             return None
         try:
             llm = ChatGoogleGenerativeAI(
@@ -254,7 +287,7 @@ def run_research(ticker: str, use_sample_articles: bool) -> dict[str, Any]:
     data = fetch_market_data(ticker)
 
     news_agent = NewsSpecialistAgent("News Specialist")
-    earnings_article_agent = EarningsSpecialistAgent("Earnings Specialist")
+    earnings_article_agent = NewsSpecialistAgent("Earnings Specialist")
     market_agent = MarketSpecialistAgent("Market Specialist")
     earnings_agent = EarningsSpecialist("Earnings Specialist")
     router = RouterAgent("Router", news_agent, earnings_article_agent, market_agent)
@@ -268,27 +301,24 @@ def run_research(ticker: str, use_sample_articles: bool) -> dict[str, Any]:
 
     articles: list[dict[str, str]] = []
     for item in raw_news:
-        content = item.get("content") or item
-        if not isinstance(content, dict):
-            continue
+        content = item.get("content", item)
         title = content.get("title") or item.get("title")
-        summary = content.get("summary") or item.get("summary") or content.get("description") or ""
-        provider = content.get("provider") or {}
-        source_name = (
-            provider.get("displayName") if isinstance(provider, dict) else None
-        ) or item.get("publisher") or "Yahoo Finance"
-        canonical = content.get("canonicalUrl") or content.get("clickThroughUrl") or {}
-        article_url = canonical.get("url") if isinstance(canonical, dict) else None
+        summary = content.get("summary") or item.get("summary") or ""
         if title:
             articles.append({
                 "title": str(title),
                 "text": str(summary),
                 "category": "news",
-                "source": str(source_name),
-                "url": str(article_url or ""),
+                "source": "Yahoo Finance",
             })
 
     news_is_live = bool(articles)
+    if not articles:
+        # Secondary live source: Google News RSS. It may also be unavailable
+        # when the deployment environment blocks external requests.
+        articles = fetch_google_news_rss(ticker)
+        news_is_live = bool(articles)
+
     if not articles and use_sample_articles:
         articles = [
             {
@@ -420,21 +450,7 @@ if result:
 
     with tab_market:
         st.markdown("### Price history")
-        history = result["history"].copy()
-        if plt is not None:
-            fig, ax = plt.subplots(figsize=(12, 4))
-            ax.plot(history.index, history["Close"], linewidth=2)
-            ax.set_title(f"{report['ticker']} adjusted closing price (1 year)")
-            ax.set_xlabel("Trading date")
-            ax.set_ylabel("Price")
-            ax.grid(True, alpha=0.25)
-            fig.autofmt_xdate()
-            fig.tight_layout()
-            st.pyplot(fig, width="stretch")
-            plt.close(fig)
-        else:
-            # Streamlit fallback; index is limited to actual returned observations.
-            st.line_chart(history[["Close"]], width="stretch")
+        st.line_chart(result["history"]["Close"], width="stretch")
         st.markdown("### Technical indicators")
         technical = {
             "50-day SMA": metrics["sma50"],
@@ -460,31 +476,26 @@ if result:
         st.write(report["fundamental_analysis"]["analysis"])
 
     with tab_news:
-        st.write(
-            "Live news status: **Available**" if report["live_news_available"]
-            else "**Unavailable — sample articles, if enabled, are illustrative only.**"
-        )
+        if report["live_news_available"]:
+            st.write("Live news status: **Available**")
+            st.caption("News is retrieved from Yahoo Finance or, if needed, Google News RSS.")
+        else:
+            st.warning(
+                "Live news could not be retrieved from Yahoo Finance or Google News RSS. "
+                "If sample articles are enabled, the examples below are illustrative only."
+            )
         if report["routed_articles"]:
             for article in report["routed_articles"]:
                 with st.expander(
                     f"{article['specialist']} · {article['article_title']}"
                 ):
-                    st.caption(
-                        f"Category: {article['category']} · "
-                        f"Source: {article.get('source', 'Unspecified')}"
-                    )
-                    if article.get("url"):
-                        st.markdown(f"[Open source article]({article['url']})")
+                    st.caption(f"Category: {article['category']}")
                     st.write(article["analysis"])
         else:
             st.warning("No articles were available for article-level routing.")
 
     with tab_logs:
         st.markdown("### Evaluation checks")
-        st.caption(
-            "The score is the percentage of these four binary checks that passed; "
-            "it is a workflow-completeness indicator, not a measure of investment accuracy."
-        )
         st.json(report["evaluation"]["checks"])
         st.markdown("### Evaluator feedback")
         if report["evaluation"]["feedback"]:
@@ -493,11 +504,6 @@ if result:
         else:
             st.success("All configured checks passed.")
         st.markdown("### Local research memory")
-        st.caption(
-            "The live_news_available column is TRUE only when the data provider returned "
-            "news articles. FALSE means no live articles were retrieved; it does not mean "
-            "the stock or research result is false."
-        )
         memory = load_memory()
         if memory:
             st.dataframe(pd.DataFrame(memory[::-1]), width="stretch", hide_index=True)
