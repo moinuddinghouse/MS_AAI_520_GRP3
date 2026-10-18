@@ -1,117 +1,75 @@
-# Multi-Agent Financial Analysis System
+# Multi-Agent Investment Research System
 
-A team project for the MS Applied AI program demonstrating an agentic
-investment-research workflow. The system coordinates specialist agents
-to analyze market data, company financial information, and financial
-news, then evaluates and refines an integrated research summary.
+A Streamlit demo of a multi-agent financial research workflow. It retrieves market data from Yahoo Finance, calculates technical indicators, routes articles to specialist agents, evaluates evidence coverage, and saves a small local research history.
 
-## Team Members
+## Features
 
--   Moinuddin K
--   Ravisha Krishnamurthy
--   Priya
+- Stock ticker input and market-price chart
+- Technical indicators: 50-day SMA, 200-day SMA, RSI (14), annualized volatility, and one-year return
+- Fundamental metrics when Yahoo Finance provides them
+- Specialist roles for news, earnings, and market analysis
+- Article routing with visibly labelled illustrative samples when live news is unavailable
+- Evidence-aware evaluation that does not count sample articles as live news
+- Optional Gemini-generated narrative analysis
+- JSON report download and local research-memory table
 
-## Project Objectives
+## Important limitations
 
-The project demonstrates the agent functions and workflow patterns
-required by the assignment.
+- Yahoo Finance may return incomplete data, rate-limit requests, or return no news.
+- Illustrative sample articles are hypothetical and must not be described as real news.
+- Local JSON memory is suitable for a demo, not reliable persistent storage on Streamlit Community Cloud. It may be lost after restart or redeployment.
+- The app is for educational purposes only and does not provide personalized investment advice.
 
-### Agent Functions
+## Run locally
 
--   **Planning:** `ResearchManagerAgent` creates a research plan for a
-    stock ticker.
--   **Tool use:** Retrieves market history, company information, and
-    news through Yahoo Finance using `yfinance`.
--   **Self-reflection:** `EvaluatorAgent` checks the integrated analysis
-    for evidence, risk discussion, and uncertainty.
--   **Learning across runs:** A persistent JSON memory file stores notes
-    from previous runs for later analyses.
+Python 3.10+ is recommended.
 
-### Workflow Patterns
+```bash
+python -m venv .venv
+source .venv/bin/activate        # macOS/Linux
+# .venv\Scripts\activate         # Windows
 
-1.  **Prompt chaining:** News is ingested, preprocessed, classified,
-    enriched with topics, and summarized.
-2.  **Routing:** `RouterAgent` dispatches market, earnings, and news
-    tasks to the appropriate specialist agents.
-3.  **Evaluator--Optimizer:** The Evaluator provides feedback, the
-    Optimizer refines the analysis, and the result is evaluated again.
+pip install -r requirements.txt
+streamlit run app.py
+```
 
-## Main Components
+The app should open in your browser at the local URL printed by Streamlit.
 
--   `ResearchManagerAgent` --- creates the research plan.
--   `MarketSpecialistAgent` --- analyzes historical prices, returns,
-    volatility, and moving averages.
--   `EarningsSpecialistAgent` --- retrieves available company-level
-    financial metrics.
--   `NewsSpecialistAgent` --- ingests and processes financial news.
--   `RouterAgent` --- dispatches tasks to the relevant specialist.
--   `EvaluatorAgent` --- assesses analysis quality and identifies
-    missing elements.
--   `OptimizerAgent` --- improves the analysis using evaluator feedback.
--   Persistent memory --- stores brief notes across runs.
+## Optional Gemini setup
 
-## Technology Stack
+Without an API key, the app uses deterministic fallback summaries. To enable Gemini locally, set an environment variable before running the app:
 
--   Python and Jupyter Notebook
--   `yfinance`
--   `pandas` and `numpy`
--   `matplotlib`
--   Gemini API integration, when configured
--   JSON for persistent memory
+```bash
+export GOOGLE_API_KEY="your-key-here"   # macOS/Linux
+# set GOOGLE_API_KEY=your-key-here      # Windows Command Prompt
+```
 
-Install the packages imported by the notebook if they are not already
-installed.
+Do not commit API keys to GitHub.
 
-## Getting Started
+For Streamlit Community Cloud, add this in the app's **Settings → Secrets**:
 
-1.  Clone or download this repository.
-2.  Open the project notebook in Jupyter Notebook, JupyterLab, or VS
-    Code.
-3.  Install the Python packages imported by the notebook.
-4.  If using Gemini, configure your API key locally using the
-    environment-variable or `.env` approach described in the notebook.
-5.  Run notebook cells from top to bottom.
-6.  Adjust the stock ticker and analysis period in the notebook
-    configuration as needed.
+```toml
+GOOGLE_API_KEY = "your-key-here"
+```
 
-**Security:** Never commit API keys or `.env` files to GitHub.
+## Deploy to Streamlit Community Cloud
 
-External data and news availability can vary between runs. When data is
-unavailable, the system should report the limitation rather than
-inventing evidence. The notebook includes a deterministic fallback for
-cases where optional LLM functionality or external data is unavailable.
+1. Create a GitHub repository for this project.
+2. Upload `app.py`, `requirements.txt`, and `README.md`.
+3. Open https://share.streamlit.io/ and connect your GitHub account.
+4. Create an app from the repository and choose `app.py` as the entry point.
+5. Add `GOOGLE_API_KEY` in the app's Secrets settings if using Gemini.
+6. Deploy and test with a ticker such as `AAPL`.
 
-## Outputs
+## Architecture
 
-Depending on data availability, the notebook produces:
+1. **Research UI / orchestrator:** accepts a ticker and runs the research workflow.
+2. **Market Specialist:** summarizes price-derived indicators.
+3. **Earnings Specialist:** reports available fundamental metrics without inventing missing values.
+4. **Router:** dispatches articles to the appropriate specialist.
+5. **Evaluator:** scores market-data availability, fundamental-data availability, live-news availability, and whether article routing was demonstrated.
+6. **Memory:** appends a compact record of each run to `research_memory.json`.
 
--   A research plan for the selected ticker
--   Market analysis and visualizations
--   Available company-level financial metrics
--   Processed and categorized news, topics, and a summary
--   An integrated investment research summary
--   Initial and final evaluation results
--   A persistent memory note for future runs
+## Academic integrity and attribution
 
-This is an educational research prototype, not financial advice. Its
-results depend on the availability, quality, and timeliness of external
-data and should not be used as the sole basis for investment decisions.
-
-## GitHub Repository
-
-https://github.com/moinuddinghouse/MS_AAI_520_GRP3
-
-## AI-Assistance Disclosure
-
-AI-assisted tools, including ChatGPT and Gemini, were used during
-development for tasks such as discussing agent architecture, explaining
-implementation approaches, troubleshooting code, and improving
-documentation. The team should ensure this statement accurately reflects
-its actual use. Team members remain responsible for understanding,
-testing, and validating the submitted implementation.
-
-## Academic Integrity and Team Contribution
-
-Ensure that the submitted notebook, documentation, and peer evaluations
-accurately reflect team contributions and comply with course
-requirements.
+Adapt this project to your team's implementation, understand each component, and disclose AI assistance in accordance with your course requirements. Verify data outputs before using them in academic submissions.
