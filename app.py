@@ -246,8 +246,12 @@ class NewsSpecialistAgent:
     """Retrieve real news from Yahoo Finance, falling back to FMP when configured."""
 
     def __init__(self):
-        self.data_source = "Yahoo Finance"
+        self.data_source = "Unavailable"
         self.retrieval_error = None
+        self.diagnostics = {
+            "Yahoo Finance": "Not queried yet.",
+            "Financial Modeling Prep": "Not queried yet.",
+        }
 
     @staticmethod
     def _fmp_api_key() -> str | None:
@@ -258,68 +262,121 @@ class NewsSpecialistAgent:
             pass
         return key or None
 
+    @staticmethod
+    def _normalise_fmp_payload(payload, ticker: str) -> list[dict]:
+        """Handle common FMP news payload shapes without inventing article data."""
+        if isinstance(payload, dict):
+            # Some API responses wrap records in a data/results property.
+            for key in ("data", "results", "articles"):
+                if isinstance(payload.get(key), list):
+                    payload = payload[key]
+                    break
+            else:
+                return []
+        if not isinstance(payload, list):
+            return []
+
+        rows = []
+        ticker_upper = ticker.upper()
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            symbol_value = item.get("symbol") or item.get("symbols")
+            if isinstance(symbol_value, list):
+                symbols = {str(value).upper() for value in symbol_value}
+                if symbols and ticker_upper not in symbols:
+                    continue
+            elif isinstance(symbol_value, str) and symbol_value.strip():
+                symbols = {value.strip().upper() for value in symbol_value.split(",")}
+                if ticker_upper not in symbols:
+                    continue
+
+            title = str(item.get("title") or "").strip()
+            summary = str(item.get("text") or item.get("summary") or "").strip()
+            if not title:
+                continue
+            rows.append({
+                "title": title,
+                "publisher": str(item.get("publisher") or item.get("site") or item.get("source") or ""),
+                "summary": summary,
+                "link": str(item.get("url") or item.get("link") or ""),
+                "published": item.get("publishedDate") or item.get("published_at") or item.get("date") or "",
+            })
+        return rows
+
     def _get_fmp_news(self, ticker: str) -> tuple[list[dict], str | None]:
         api_key = self._fmp_api_key()
         if not api_key:
-            return [], (
-                "Yahoo Finance returned no news. To enable news fallback, add FMP_API_KEY "
-                "to Streamlit Secrets. Keep the key out of app.py and GitHub."
-            )
+            message = "FMP_API_KEY is not configured in Streamlit Secrets or the environment."
+            self.diagnostics["Financial Modeling Prep"] = message
+            return [], message
 
-        # Official FMP Search Stock News endpoint: /stable/news/stock?symbols=AAPL
+        # FMP stable stock-news endpoint. API access may depend on the user's plan.
         try:
             response = requests.get(
                 "https://financialmodelingprep.com/stable/news/stock",
                 params={"symbols": ticker, "page": 0, "limit": 20, "apikey": api_key},
-                timeout=12,
+                timeout=15,
             )
             if response.status_code != 200:
-                return [], f"FMP stock-news endpoint returned HTTP {response.status_code}. Check API key and plan access."
-            payload = response.json()
-            if isinstance(payload, dict):
-                if payload.get("Error Message") or payload.get("Error") or payload.get("error"):
-                    return [], "FMP stock-news endpoint returned an API error. Check API key and plan access."
-                return [], "FMP stock-news endpoint returned an unexpected response format."
-            if not isinstance(payload, list):
-                return [], "FMP stock-news endpoint returned an unexpected response format."
+                # Avoid displaying the response body, which could contain request details.
+                message = (
+                    f"FMP stock-news endpoint returned HTTP {response.status_code}. "
+                    "Check the API key, endpoint availability, and subscription plan."
+                )
+                self.diagnostics["Financial Modeling Prep"] = message
+                return [], message
 
-            rows = []
-            ticker_upper = ticker.upper()
-            for item in payload:
-                if not isinstance(item, dict):
-                    continue
-                # The endpoint is symbol-filtered, but verify symbols when present.
-                item_symbol = str(item.get("symbol") or "").upper()
-                if item_symbol and item_symbol != ticker_upper:
-                    continue
-                title = item.get("title") or ""
-                summary = item.get("text") or item.get("summary") or ""
-                if not title and not summary:
-                    continue
-                rows.append({
-                    "title": title,
-                    "publisher": item.get("publisher") or item.get("site") or "",
-                    "summary": summary,
-                    "link": item.get("url") or "",
-                    "published": item.get("publishedDate") or "",
-                })
+            try:
+                payload = response.json()
+            except ValueError:
+                message = "FMP stock-news endpoint returned invalid JSON."
+                self.diagnostics["Financial Modeling Prep"] = message
+                return [], message
+
+            if isinstance(payload, dict) and any(k in payload for k in ("Error Message", "Error", "error")):
+                message = "FMP returned an API error. Check the API key, endpoint, and subscription plan."
+                self.diagnostics["Financial Modeling Prep"] = message
+                return [], message
+
+            rows = self._normalise_fmp_payload(payload, ticker)
             if rows:
-                self.data_source = "Financial Modeling Prep"
+                self.diagnostics["Financial Modeling Prep"] = f"Retrieved {len(rows)} usable article(s)."
                 return rows[:20], None
-            return [], "FMP returned no matching news articles for this ticker."
+
+            message = "FMP returned a successful response but no usable articles matched this ticker."
+            if isinstance(payload, dict):
+                message += f" Response keys: {', '.join(str(k) for k in list(payload.keys())[:15])}."
+            self.diagnostics["Financial Modeling Prep"] = message
+            return [], message
+        except requests.Timeout:
+            message = "FMP stock-news request timed out after 15 seconds."
+            self.diagnostics["Financial Modeling Prep"] = message
+            return [], message
         except requests.RequestException as exc:
-            return [], f"FMP stock-news request failed: {type(exc).__name__}."
-        except (ValueError, TypeError):
-            return [], "FMP stock-news endpoint returned unreadable data."
+            message = f"FMP stock-news request failed ({type(exc).__name__})."
+            self.diagnostics["Financial Modeling Prep"] = message
+            return [], message
+        except (TypeError, ValueError) as exc:
+            message = f"FMP stock-news response could not be parsed ({type(exc).__name__})."
+            self.diagnostics["Financial Modeling Prep"] = message
+            return [], message
 
     def ingest(self, ticker: str) -> pd.DataFrame:
         rows = []
-        yahoo_error = None
         try:
             raw_items = yf.Ticker(ticker).news or []
+            if not isinstance(raw_items, list):
+                raw_items = []
+                self.diagnostics["Yahoo Finance"] = "Yahoo Finance returned a non-list news response."
+            else:
+                self.diagnostics["Yahoo Finance"] = (
+                    f"Yahoo Finance returned {len(raw_items)} raw item(s)."
+                    if raw_items else "Yahoo Finance returned no news articles."
+                )
         except Exception as exc:
             raw_items = []
-            yahoo_error = f"Yahoo Finance news request failed: {type(exc).__name__}."
+            self.diagnostics["Yahoo Finance"] = f"Yahoo Finance news request failed ({type(exc).__name__})."
 
         for item in raw_items[:20]:
             if not isinstance(item, dict):
@@ -329,30 +386,35 @@ class NewsSpecialistAgent:
                 continue
             provider = content.get("provider", {}) or {}
             canonical = content.get("canonicalUrl", {}) or {}
-            title = content.get("title") or item.get("title") or ""
+            title = str(content.get("title") or item.get("title") or "").strip()
             summary = content.get("summary") or item.get("summary") or item.get("text") or ""
-            # Do not treat empty/malformed payload entries as news evidence.
-            if not str(title).strip():
+            if not title:
                 continue
             rows.append({
-                "title": str(title).strip(),
+                "title": title,
                 "publisher": provider.get("displayName", "") if isinstance(provider, dict) else item.get("publisher", ""),
-                "summary": summary,
+                "summary": str(summary or ""),
                 "link": canonical.get("url", "") if isinstance(canonical, dict) else item.get("link", ""),
                 "published": content.get("pubDate") or item.get("providerPublishTime", ""),
             })
 
-        # If Yahoo returns nothing, try the separately configured FMP news API.
-        if not rows:
-            rows, fmp_error = self._get_fmp_news(ticker)
-            if not rows:
-                self.data_source = "Unavailable"
-                self.retrieval_error = " ".join(part for part in [yahoo_error or "Yahoo Finance returned no news articles.", fmp_error] if part)
-            else:
-                self.retrieval_error = None
-        else:
+        if rows:
             self.data_source = "Yahoo Finance"
             self.retrieval_error = None
+            self.diagnostics["Yahoo Finance"] = f"Retrieved {len(rows)} usable article(s)."
+            self.diagnostics["Financial Modeling Prep"] = "Not needed because Yahoo Finance returned usable articles."
+        else:
+            fmp_rows, fmp_error = self._get_fmp_news(ticker)
+            if fmp_rows:
+                rows = fmp_rows
+                self.data_source = "Financial Modeling Prep"
+                self.retrieval_error = None
+            else:
+                self.data_source = "Unavailable"
+                self.retrieval_error = (
+                    f"Yahoo Finance: {self.diagnostics['Yahoo Finance']} "
+                    f"Financial Modeling Prep: {fmp_error or self.diagnostics['Financial Modeling Prep']}"
+                )
 
         return pd.DataFrame(rows, columns=["title", "publisher", "summary", "link", "published"])
 
@@ -646,6 +708,7 @@ MEMORY
         "news_summary": news_summary,
         "news_source": news_agent.data_source,
         "news_retrieval_error": news_agent.retrieval_error,
+        "news_diagnostics": news_agent.diagnostics.copy(),
         "integrated_analysis": integrated,
     }
     first_eval = evaluator.evaluate(result)
@@ -787,9 +850,11 @@ if result:
     articles = result["news"]
     if articles.empty:
         st.info("No recent news was returned by the configured sources in this run. The dashboard does not create substitute news evidence.")
-        if result.get("news_retrieval_error"):
-            with st.expander("News-data diagnostic details"):
+        with st.expander("News-data diagnostic details", expanded=True):
+            if result.get("news_retrieval_error"):
                 st.write(result["news_retrieval_error"])
+            for provider_name, diagnostic in result.get("news_diagnostics", {}).items():
+                st.write(f"**{provider_name}:** {diagnostic}")
     else:
         cols = [c for c in ["title", "publisher", "category", "topics", "routed_to", "link"] if c in articles.columns]
         st.dataframe(articles[cols], hide_index=True, width="stretch")
