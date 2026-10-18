@@ -54,3 +54,7 @@ Never commit API keys to GitHub or hard-code them in `app.py`.
 - The evaluator score is a completeness checklist, not a financial prediction accuracy metric.
 - Memory is session-level and may not persist across sessions or server restarts.
 - This is an educational research tool, not investment advice.
+
+
+## Updated report layout
+The dashboard displays the executive summary, market analysis, fundamentals, news evidence, evaluation checklist, and session memory together on one page. The checklist score now requires adequate market history, at least three fundamental fields, and usable linked news to award those checks. It is a completeness score, not investment accuracy.

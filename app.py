@@ -150,14 +150,33 @@ if run:
             news, diagnostics = get_news(stock, ticker)
             prior = next((x["lesson"] for x in reversed(st.session_state.memory) if x["ticker"] == ticker), None)
             report = make_report(ticker, market, info, news, prior)
+            # Score actual evidence coverage, not merely whether a variable exists.
+            has_news_title = (
+                not news.empty and "Title" in news.columns
+                and news["Title"].fillna("").astype(str).str.strip().ne("").any()
+            )
+            has_news_link = (
+                not news.empty and "Link" in news.columns
+                and news["Link"].fillna("").astype(str).str.startswith("http").any()
+            )
+            fundamental_keys = ["marketCap", "trailingPE", "profitMargins", "returnOnEquity", "revenueGrowth"]
+            fundamental_coverage = sum(info.get(k) is not None for k in fundamental_keys)
+            news_failure_disclosed = "no usable articles" in report.lower() or "no usable headlines" in report.lower()
             checks = {
-                "Market data present": "error" not in market,
-                "At least one useful fundamental field present": any(info.get(k) is not None for k in ["trailingPE", "profitMargins", "marketCap", "totalRevenue"]),
-                "News provider checked": isinstance(news, pd.DataFrame),
-                "Risk disclosure included": "Risk and limitations" in report,
-                "Missing evidence disclosed": "N/A" in report or not news.empty,
+                "Market data coverage adequate (20+ observations)": (
+                    "error" not in market and market.get("latest_price") is not None
+                    and market.get("observations", 0) >= 20
+                ),
+                "Fundamental coverage adequate (3+ fields)": fundamental_coverage >= 3,
+                "Usable news evidence retrieved": has_news_title and has_news_link,
+                "Risk disclosure included": (
+                    "Risk and limitations" in report and "do not guarantee" in report.lower()
+                ),
+                "Missing evidence handled transparently": (
+                    (has_news_title and has_news_link) or news_failure_disclosed
+                ) and ("N/A" in report or "not available" in report.lower() or "Risk and limitations" in report),
             }
-            score = round(sum(checks.values()) / len(checks) * 100)
+            score = round(sum(bool(v) for v in checks.values()) / len(checks) * 100)
             st.session_state.result = {
                 "ticker": ticker, "period": period, "time": datetime.now(timezone.utc).isoformat(),
                 "history": history, "market": market, "info": info, "news": news,
@@ -183,75 +202,103 @@ c2.metric("Period return", number(m.get("period_return_pct"), suffix="%"))
 c3.metric("Annualized volatility", number(m.get("annualized_volatility_pct"), suffix="%"))
 c4.metric("Checklist score", f"{r['score']}/100", help="Completeness checklist, not a measure of investment accuracy.")
 
-t1, t2, t3, t4, t5 = st.tabs(["Executive report", "Market analysis", "Fundamentals", "News & routing", "Evaluation & memory"])
-with t1:
-    st.markdown(r["report"])
-    st.download_button("Download report (.md)", r["report"], file_name=f"{r['ticker']}_research_report.md", mime="text/markdown")
-    if st.button("Optional Gemini report review"):
-        api_key = None
-        try:
-            api_key = st.secrets.get("GOOGLE_API_KEY")
-        except Exception:
-            api_key = os.getenv("GOOGLE_API_KEY")
-        if not api_key:
-            st.warning("Add GOOGLE_API_KEY under Streamlit app Settings → Secrets to enable Gemini review.")
-        else:
-            try:
-                from google import genai
-                client = genai.Client(api_key=api_key)
-                with st.spinner("Reviewing report with Gemini…"):
-                    response = client.models.generate_content(model="gemini-2.5-flash", contents="Review this educational financial research report for missing caveats and unsupported claims. Do not make buy/sell recommendations. Be concise.\n\n" + r["report"])
-                st.write(response.text)
-            except Exception as exc:
-                st.warning(f"Gemini review unavailable: {exc}")
-with t2:
-    history = r["history"]
-    if not history.empty:
-        chart = history.copy()
-        chart["MA20"] = chart["Close"].rolling(20).mean()
-        chart["MA50"] = chart["Close"].rolling(50).mean()
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=chart.index, y=chart["Close"], name="Adjusted close"))
-        fig.add_trace(go.Scatter(x=chart.index, y=chart["MA20"], name="20-day MA"))
-        fig.add_trace(go.Scatter(x=chart.index, y=chart["MA50"], name="50-day MA"))
-        fig.update_layout(title=f"{r['ticker']} price and moving averages", xaxis_title="Date", yaxis_title="Price", hovermode="x unified")
-        st.plotly_chart(fig, use_container_width=True)
-        st.dataframe(history.tail(20), use_container_width=True)
-    else:
-        st.warning("No market history returned.")
+# All sections are presented together as one consolidated report page (no separate tabs).
+st.markdown("## Executive research report")
+st.markdown("### 1. Executive summary")
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Latest adjusted close", number(m.get("latest_price"), "$"))
+c2.metric("Period return", number(m.get("period_return_pct"), suffix="%"))
+c3.metric("Annualized volatility", number(m.get("annualized_volatility_pct"), suffix="%"))
+c4.metric("Evidence checklist score", f"{r['score']}/100", help="Evidence completeness score, not investment accuracy.")
+st.markdown(r["report"])
+st.download_button(
+    "Download complete research report (.md)", r["report"],
+    file_name=f"{r['ticker']}_research_report.md", mime="text/markdown",
+    key="download_complete_report",
+)
+
+st.divider()
+st.markdown("### 2. Market analysis")
+history = r["history"]
+if not history.empty:
+    chart = history.copy()
+    chart["MA20"] = chart["Close"].rolling(20).mean()
+    chart["MA50"] = chart["Close"].rolling(50).mean()
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=chart.index, y=chart["Close"], name="Adjusted close"))
+    fig.add_trace(go.Scatter(x=chart.index, y=chart["MA20"], name="20-day MA"))
+    fig.add_trace(go.Scatter(x=chart.index, y=chart["MA50"], name="50-day MA"))
+    fig.update_layout(title=f"{r['ticker']} price and moving averages", xaxis_title="Date", yaxis_title="Price", hovermode="x unified")
+    st.plotly_chart(fig, use_container_width=True)
+    st.dataframe(history.tail(20), use_container_width=True)
+else:
+    st.warning("No market history returned.")
+with st.expander("Market specialist details", expanded=False):
     st.json(m)
-with t3:
-    cols = st.columns(3)
-    metrics = [("Market cap", "marketCap", "money"), ("Trailing P/E", "trailingPE", "num"), ("Forward P/E", "forwardPE", "num"), ("Profit margin", "profitMargins", "pct"), ("Operating margin", "operatingMargins", "pct"), ("Return on equity", "returnOnEquity", "pct"), ("Revenue growth", "revenueGrowth", "pct"), ("Debt-to-equity", "debtToEquity", "num"), ("Beta", "beta", "num")]
-    for i, (label, key, kind) in enumerate(metrics):
-        v = info.get(key)
-        if kind == "money": value = number(v, "$", digits=0)
-        elif kind == "pct": value = number(v * 100, suffix="%") if v is not None else "N/A"
-        else: value = number(v)
-        cols[i % 3].metric(label, value)
-    st.write("**Sector:**", info.get("sector") or "N/A", " | **Industry:**", info.get("industry") or "N/A")
-    st.caption("Provider fields may be missing, delayed, or revised.")
-with t4:
-    st.markdown("**Routing:** Research Manager → News Specialist → Report synthesis → Evaluator")
-    if news.empty:
-        st.warning("No usable headlines were returned. Do not infer current sentiment from missing data.")
-        for msg in r["diagnostics"]:
-            st.caption(msg)
+
+st.divider()
+st.markdown("### 3. Earnings and fundamental analysis")
+cols = st.columns(3)
+metrics = [("Market cap", "marketCap", "money"), ("Trailing P/E", "trailingPE", "num"), ("Forward P/E", "forwardPE", "num"), ("Profit margin", "profitMargins", "pct"), ("Operating margin", "operatingMargins", "pct"), ("Return on equity", "returnOnEquity", "pct"), ("Revenue growth", "revenueGrowth", "pct"), ("Debt-to-equity", "debtToEquity", "num"), ("Beta", "beta", "num")]
+for i, (label, key, kind) in enumerate(metrics):
+    v = info.get(key)
+    if kind == "money": value = number(v, "$", digits=0)
+    elif kind == "pct": value = number(v * 100, suffix="%") if v is not None else "N/A"
+    else: value = number(v)
+    cols[i % 3].metric(label, value)
+st.write("**Company:**", info.get("longName") or r["ticker"])
+st.write("**Sector:**", info.get("sector") or "N/A", " | **Industry:**", info.get("industry") or "N/A")
+st.caption("Provider fields may be missing, delayed, or revised.")
+
+st.divider()
+st.markdown("### 4. News evidence and specialist routing")
+st.markdown("**Routing:** Research Manager → News Specialist → Report synthesis → Evaluator")
+if news.empty:
+    st.warning("No usable headlines were returned. Do not infer current sentiment from missing data.")
+    for msg in r["diagnostics"]:
+        st.caption(msg)
+else:
+    for _, row in news.iterrows():
+        title = str(row["Title"])
+        link = str(row.get("Link", ""))
+        st.markdown(f"**[{title}]({link})**" if link.startswith("http") else f"**{title}**")
+        st.caption(f"{row['Publisher']} · {row['Published']} · {row['Source']}")
+        st.divider()
+
+st.divider()
+st.markdown("### 5. Evaluator–optimizer checklist")
+st.metric("Evidence completeness", f"{r['score']}/100", help="This is not a measure of investment prediction accuracy.")
+passed = sum(bool(v) for v in r["checks"].values())
+st.caption(f"{passed} of {len(r['checks'])} checks passed. Failed checks indicate missing evidence or insufficient data coverage.")
+for name, passed_check in r["checks"].items():
+    st.write(("✅ " if passed_check else "⚠️ ") + name)
+
+st.divider()
+st.markdown("### 6. Session memory and execution record")
+st.caption("Memory is held in the current Streamlit session; it may not persist across sessions or server restarts.")
+st.dataframe(pd.DataFrame(st.session_state.memory), use_container_width=True)
+
+if st.button("Optional Gemini report review"):
+    api_key = None
+    try:
+        api_key = st.secrets.get("GOOGLE_API_KEY")
+    except Exception:
+        api_key = os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        st.warning("Add GOOGLE_API_KEY under Streamlit app Settings → Secrets to enable Gemini review.")
     else:
-        for _, row in news.iterrows():
-            title = str(row["Title"])
-            link = str(row.get("Link", ""))
-            st.markdown(f"**[{title}]({link})**" if link.startswith("http") else f"**{title}**")
-            st.caption(f"{row['Publisher']} · {row['Published']} · {row['Source']}")
-            st.divider()
-with t5:
-    st.markdown("### Evaluator checklist")
-    for name, passed in r["checks"].items():
-        st.write(("✅ " if passed else "⚠️ ") + name)
-    st.caption("Score measures completeness of checks, not prediction quality or factual accuracy.")
-    st.markdown("### Session memory")
-    st.caption("Memory is held in the current Streamlit session; it may not persist across sessions or server restarts.")
-    st.dataframe(pd.DataFrame(st.session_state.memory), use_container_width=True)
+        try:
+            from google import genai
+            client = genai.Client(api_key=api_key)
+            with st.spinner("Reviewing report with Gemini…"):
+                response = client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents="Review this educational financial research report for missing caveats and unsupported claims. Do not make buy/sell recommendations. Be concise.\n\n" + r["report"],
+                )
+            st.markdown("### Gemini review")
+            st.write(response.text)
+        except Exception as exc:
+            st.warning(f"Gemini review unavailable: {exc}")
 
 st.divider()
 st.caption("Educational research only; not personalized financial advice. Validate data independently before making financial decisions.")
