@@ -581,7 +581,7 @@ with st.sidebar:
     st.header("Research settings")
     ticker = st.text_input("Stock ticker", value="AAPL", max_chars=12).strip().upper()
     period = st.selectbox("Historical period", ["1mo", "3mo", "6mo", "1y", "2y", "5y"], index=2)
-    run_button = st.button("Run investment research", type="primary", use_container_width=True)
+    run_button = st.button("Run investment research", type="primary", width="stretch")
     st.divider()
     st.caption("Market/news data is retrieved at run time and may be missing or delayed.")
     st.caption("For company fundamentals and news fallback, configure FMP_API_KEY in Streamlit Secrets.")
@@ -621,7 +621,7 @@ if result:
         if len(history) >= 50:
             fig.add_trace(go.Scatter(x=history.index, y=history["Close"].rolling(50).mean(), name="50-day moving average", mode="lines"))
         fig.update_layout(xaxis_title="Date", yaxis_title="Price", legend_title="Series", margin=dict(l=10, r=10, t=20, b=10), height=400)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     st.caption(f"Company fundamentals source: {financials.get('_data_source', 'Unknown')}")
     if financials.get("_retrieval_error"):
@@ -674,7 +674,12 @@ if result:
                 if isinstance(financials.get("revenueGrowth"), (int, float)) else "Unavailable"
             ),
         }
-        st.dataframe(pd.DataFrame(display_metrics.items(), columns=["Metric", "Value"]), hide_index=True, use_container_width=True)
+        metrics_df = pd.DataFrame(display_metrics.items(), columns=["Metric", "Value"])
+        # Keep the display column consistently textual. The values intentionally
+        # mix labels, numbers, and formatted currency/percentage strings; forcing
+        # a single string dtype prevents PyArrow serialization errors in Streamlit.
+        metrics_df["Value"] = metrics_df["Value"].map(lambda value: str(value) if value is not None else "Unavailable")
+        st.dataframe(metrics_df, hide_index=True, width="stretch")
 
     st.subheader("News pipeline and routing")
     st.caption(f"News source: {result.get('news_source', 'Unknown')}")
@@ -686,7 +691,7 @@ if result:
                 st.write(result["news_retrieval_error"])
     else:
         cols = [c for c in ["title", "publisher", "category", "topics", "routed_to", "link"] if c in articles.columns]
-        st.dataframe(articles[cols], hide_index=True, use_container_width=True)
+        st.dataframe(articles[cols], hide_index=True, width="stretch")
     with st.expander("News summary"):
         st.text(result["news_summary"])
 
@@ -704,7 +709,7 @@ if result:
     st.subheader("Final evaluation")
     st.metric("Rule-based quality score", f"{eval_result['score']:.0f}/100")
     st.caption("This is a simple checklist score, not a measure of investment performance or a guarantee of correctness.")
-    st.dataframe(pd.DataFrame([{"Check": k.replace("_", " ").title(), "Passed": bool(v)} for k, v in eval_result["checks"].items()]), hide_index=True, use_container_width=True)
+    st.dataframe(pd.DataFrame([{"Check": k.replace("_", " ").title(), "Passed": bool(v)} for k, v in eval_result["checks"].items()]), hide_index=True, width="stretch")
 
     st.subheader("Optimized research summary")
     st.text_area("Final analysis", result["optimized_analysis"], height=360)
@@ -718,7 +723,7 @@ if result:
     with st.expander("Persistent memory (recent runs)"):
         mem = load_memory()
         if mem:
-            st.dataframe(pd.DataFrame(mem).tail(10), hide_index=True, use_container_width=True)
+            st.dataframe(pd.DataFrame(mem).tail(10), hide_index=True, width="stretch")
         else:
             st.info("No memory records are available yet.")
 else:
