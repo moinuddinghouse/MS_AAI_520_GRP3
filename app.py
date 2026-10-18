@@ -99,8 +99,12 @@ class BaseAgent:
 
     def _gemini(self, prompt: str) -> str | None:
         """Return a Gemini response when configured; otherwise return None."""
-        api_key = st.secrets.get("GOOGLE_API_KEY", os.getenv("GOOGLE_API_KEY", ""))
-        if not api_key or ChatGoogleGenerativeAI is None:
+        try:
+            api_key = st.secrets.get("GOOGLE_API_KEY", "")
+        except Exception:
+            api_key = ""
+        api_key = api_key or os.getenv("GOOGLE_API_KEY", "")
+        if not api_key or ChatGoogleGenerativeAI is None or HumanMessage is None:
             return None
         try:
             llm = ChatGoogleGenerativeAI(
@@ -250,7 +254,7 @@ def run_research(ticker: str, use_sample_articles: bool) -> dict[str, Any]:
     data = fetch_market_data(ticker)
 
     news_agent = NewsSpecialistAgent("News Specialist")
-    earnings_article_agent = NewsSpecialistAgent("Earnings Specialist")
+    earnings_article_agent = EarningsSpecialistAgent("Earnings Specialist")
     market_agent = MarketSpecialistAgent("Market Specialist")
     earnings_agent = EarningsSpecialist("Earnings Specialist")
     router = RouterAgent("Router", news_agent, earnings_article_agent, market_agent)
@@ -264,15 +268,24 @@ def run_research(ticker: str, use_sample_articles: bool) -> dict[str, Any]:
 
     articles: list[dict[str, str]] = []
     for item in raw_news:
-        content = item.get("content", item)
+        content = item.get("content") or item
+        if not isinstance(content, dict):
+            continue
         title = content.get("title") or item.get("title")
-        summary = content.get("summary") or item.get("summary") or ""
+        summary = content.get("summary") or item.get("summary") or content.get("description") or ""
+        provider = content.get("provider") or {}
+        source_name = (
+            provider.get("displayName") if isinstance(provider, dict) else None
+        ) or item.get("publisher") or "Yahoo Finance"
+        canonical = content.get("canonicalUrl") or content.get("clickThroughUrl") or {}
+        article_url = canonical.get("url") if isinstance(canonical, dict) else None
         if title:
             articles.append({
                 "title": str(title),
                 "text": str(summary),
                 "category": "news",
-                "source": "Yahoo Finance",
+                "source": str(source_name),
+                "url": str(article_url or ""),
             })
 
     news_is_live = bool(articles)
@@ -407,7 +420,21 @@ if result:
 
     with tab_market:
         st.markdown("### Price history")
-        st.line_chart(result["history"]["Close"], width="stretch")
+        history = result["history"].copy()
+        if plt is not None:
+            fig, ax = plt.subplots(figsize=(12, 4))
+            ax.plot(history.index, history["Close"], linewidth=2)
+            ax.set_title(f"{report['ticker']} adjusted closing price (1 year)")
+            ax.set_xlabel("Trading date")
+            ax.set_ylabel("Price")
+            ax.grid(True, alpha=0.25)
+            fig.autofmt_xdate()
+            fig.tight_layout()
+            st.pyplot(fig, width="stretch")
+            plt.close(fig)
+        else:
+            # Streamlit fallback; index is limited to actual returned observations.
+            st.line_chart(history[["Close"]], width="stretch")
         st.markdown("### Technical indicators")
         technical = {
             "50-day SMA": metrics["sma50"],
@@ -442,13 +469,22 @@ if result:
                 with st.expander(
                     f"{article['specialist']} · {article['article_title']}"
                 ):
-                    st.caption(f"Category: {article['category']}")
+                    st.caption(
+                        f"Category: {article['category']} · "
+                        f"Source: {article.get('source', 'Unspecified')}"
+                    )
+                    if article.get("url"):
+                        st.markdown(f"[Open source article]({article['url']})")
                     st.write(article["analysis"])
         else:
             st.warning("No articles were available for article-level routing.")
 
     with tab_logs:
         st.markdown("### Evaluation checks")
+        st.caption(
+            "The score is the percentage of these four binary checks that passed; "
+            "it is a workflow-completeness indicator, not a measure of investment accuracy."
+        )
         st.json(report["evaluation"]["checks"])
         st.markdown("### Evaluator feedback")
         if report["evaluation"]["feedback"]:
@@ -457,6 +493,11 @@ if result:
         else:
             st.success("All configured checks passed.")
         st.markdown("### Local research memory")
+        st.caption(
+            "The live_news_available column is TRUE only when the data provider returned "
+            "news articles. FALSE means no live articles were retrieved; it does not mean "
+            "the stock or research result is false."
+        )
         memory = load_memory()
         if memory:
             st.dataframe(pd.DataFrame(memory[::-1]), width="stretch", hide_index=True)
