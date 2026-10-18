@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from datetime import datetime, timezone
+
+import requests
 
 import numpy as np
 import pandas as pd
@@ -53,77 +56,188 @@ class MarketSpecialistAgent:
 
 
 class EarningsSpecialistAgent:
-    """Retrieve company profile and fundamental metrics from Yahoo Finance."""
+    """Retrieve company fundamentals from Yahoo Finance, with FMP fallback."""
+
+    FUNDAMENTAL_KEYS = [
+        "longName",
+        "sector",
+        "industry",
+        "marketCap",
+        "trailingPE",
+        "forwardPE",
+        "profitMargins",
+        "returnOnEquity",
+        "debtToEquity",
+        "revenueGrowth",
+    ]
+
+    @staticmethod
+    def _fmp_api_key() -> str | None:
+        """Read the FMP key from Streamlit Secrets or an environment variable."""
+        key = os.getenv("FMP_API_KEY", "").strip()
+        try:
+            key = (st.secrets.get("FMP_API_KEY", "") or key).strip()
+        except Exception:
+            # Streamlit Secrets may not be configured locally or in the cloud.
+            pass
+        return key or None
+
+    @staticmethod
+    def _fmp_get(endpoint: str, ticker: str, api_key: str) -> tuple[dict | None, str | None]:
+        """Call one FMP stable endpoint without exposing the API key in errors."""
+        url = f"https://financialmodelingprep.com/stable/{endpoint}"
+        try:
+            response = requests.get(
+                url,
+                params={"symbol": ticker, "apikey": api_key},
+                timeout=12,
+            )
+            if response.status_code != 200:
+                return None, f"FMP {endpoint} returned HTTP {response.status_code}."
+            payload = response.json()
+            if isinstance(payload, list):
+                payload = payload[0] if payload and isinstance(payload[0], dict) else {}
+            if not isinstance(payload, dict) or not payload:
+                return None, f"FMP {endpoint} returned no usable data."
+            if payload.get("Error Message") or payload.get("Error"):
+                return None, f"FMP {endpoint} returned an API error. Check key, plan, and endpoint access."
+            return payload, None
+        except requests.RequestException as exc:
+            return None, f"FMP {endpoint} request failed: {type(exc).__name__}."
+        except (ValueError, TypeError):
+            return None, f"FMP {endpoint} returned an unreadable response."
+
+    def _from_fmp(self, ticker: str) -> dict:
+        result = {key: None for key in self.FUNDAMENTAL_KEYS}
+        result["_data_source"] = "Financial Modeling Prep"
+        result["_available_info_keys"] = []
+        api_key = self._fmp_api_key()
+        if not api_key:
+            result["_retrieval_error"] = (
+                "Yahoo Finance did not return the requested fundamentals. "
+                "To enable the fallback, add FMP_API_KEY to Streamlit Secrets. "
+                "Do not place the key in app.py or commit it to GitHub."
+            )
+            return result
+
+        errors = []
+        profile, error = self._fmp_get("profile", ticker, api_key)
+        if error:
+            errors.append(error)
+        ratios, error = self._fmp_get("ratios-ttm", ticker, api_key)
+        if error:
+            errors.append(error)
+        growth, error = self._fmp_get("income-statement-growth", ticker, api_key)
+        if error:
+            errors.append(error)
+
+        if profile:
+            result["longName"] = profile.get("companyName") or profile.get("name")
+            result["sector"] = profile.get("sector")
+            result["industry"] = profile.get("industry")
+            result["marketCap"] = self._as_number(profile.get("marketCap"))
+            result["_available_info_keys"].extend(f"profile.{key}" for key in profile.keys())
+
+        if ratios:
+            result["trailingPE"] = self._as_number(
+                ratios.get("priceToEarningsRatioTTM")
+                or ratios.get("priceEarningsRatioTTM")
+            )
+            result["profitMargins"] = self._as_number(
+                ratios.get("netProfitMarginTTM")
+                or ratios.get("netProfitMargin")
+            )
+            result["returnOnEquity"] = self._as_number(
+                ratios.get("returnOnEquityTTM")
+                or ratios.get("returnOnEquity")
+            )
+            result["debtToEquity"] = self._as_number(
+                ratios.get("debtEquityRatioTTM")
+                or ratios.get("debtToEquityRatioTTM")
+            )
+            result["_available_info_keys"].extend(f"ratios.{key}" for key in ratios.keys())
+
+        if growth:
+            result["revenueGrowth"] = self._as_number(
+                growth.get("growthRevenue")
+                or growth.get("revenueGrowth")
+            )
+            result["_available_info_keys"].extend(f"growth.{key}" for key in growth.keys())
+
+        # FMP's endpoints above do not consistently provide forward P/E. Leave it
+        # missing rather than estimating or fabricating a value.
+        found = any(result.get(key) is not None for key in self.FUNDAMENTAL_KEYS if key != "longName")
+        if found:
+            result["_retrieval_error"] = None
+            if errors:
+                result["_partial_data_note"] = "Some FMP fields/endpoints were unavailable: " + " ".join(errors)
+        else:
+            result["_retrieval_error"] = (
+                "Yahoo Finance returned no usable fundamentals and FMP did not return requested metrics. "
+                + " ".join(errors or ["Check your FMP API key, subscription access, and ticker symbol."])
+            )
+        return result
+
+    @staticmethod
+    def _as_number(value):
+        if value is None or value == "":
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     def analyze(self, ticker: str) -> dict:
-        keys = [
-            "longName",
-            "sector",
-            "industry",
-            "marketCap",
-            "trailingPE",
-            "forwardPE",
-            "profitMargins",
-            "returnOnEquity",
-            "debtToEquity",
-            "revenueGrowth",
-        ]
-        fundamental_keys = [key for key in keys if key != "longName"]
-        result = {key: None for key in keys}
-        result["_retrieval_error"] = None
-        result["_available_info_keys"] = []
+        result = {key: None for key in self.FUNDAMENTAL_KEYS}
+        result.update({
+            "_retrieval_error": None,
+            "_available_info_keys": [],
+            "_data_source": "Yahoo Finance",
+        })
+        fundamental_keys = [key for key in self.FUNDAMENTAL_KEYS if key != "longName"]
+        yahoo_error = None
 
         try:
             stock = yf.Ticker(ticker)
             info = {}
-            primary_error = None
-
-            # Try the current yfinance method first.
             try:
                 info = stock.get_info() or {}
             except Exception as exc:
-                primary_error = f"get_info(): {type(exc).__name__}: {exc}"
+                yahoo_error = f"Yahoo Finance get_info failed: {type(exc).__name__}: {exc}"
 
-            # Try .info as a fallback if get_info failed or returned no useful
-            # fundamental fields. This also helps with version differences.
-            has_fundamentals = (
-                isinstance(info, dict)
-                and any(info.get(key) is not None for key in fundamental_keys)
-            )
-            if not has_fundamentals:
+            if not isinstance(info, dict) or not any(info.get(key) is not None for key in fundamental_keys):
                 try:
                     fallback_info = stock.info or {}
                     if isinstance(fallback_info, dict) and fallback_info:
                         info = fallback_info
                 except Exception as exc:
-                    fallback_error = f".info: {type(exc).__name__}: {exc}"
-                    if primary_error:
-                        primary_error = f"{primary_error}; {fallback_error}"
-                    else:
-                        primary_error = fallback_error
+                    fallback_error = f"Yahoo Finance .info failed: {type(exc).__name__}: {exc}"
+                    yahoo_error = f"{yahoo_error}; {fallback_error}" if yahoo_error else fallback_error
 
-            if not isinstance(info, dict):
-                raise ValueError("Yahoo Finance returned a non-dictionary response.")
+            if isinstance(info, dict):
+                result.update({key: info.get(key) for key in self.FUNDAMENTAL_KEYS})
+                result["_available_info_keys"] = sorted(str(key) for key in info.keys())
 
-            result.update({key: info.get(key) for key in keys})
-            result["_available_info_keys"] = sorted(str(key) for key in info.keys())
-
-            if not any(result.get(key) is not None for key in fundamental_keys):
-                message = "Yahoo Finance returned no requested fundamental metrics."
-                if primary_error:
-                    message += f" Retrieval details: {primary_error}"
-                available = result["_available_info_keys"][:30]
-                message += f" Available response keys (first 30): {available}"
-                result["_retrieval_error"] = message
-            elif primary_error:
-                # Metrics were recovered by the fallback, so preserve the
-                # successful result without showing a misleading failure.
+            if any(result.get(key) is not None for key in fundamental_keys):
                 result["_retrieval_error"] = None
+                return result
 
+            available = result["_available_info_keys"][:30]
+            yahoo_error = yahoo_error or (
+                "Yahoo Finance returned no requested fundamental metrics. "
+                f"Available response keys (first 30): {available}"
+            )
         except Exception as exc:
-            result["_retrieval_error"] = f"{type(exc).__name__}: {exc}"
+            yahoo_error = f"Yahoo Finance retrieval failed: {type(exc).__name__}: {exc}"
 
-        return result
+        # Use FMP only when Yahoo fails to provide actual requested fundamentals.
+        fallback = self._from_fmp(ticker)
+        fallback["_yahoo_error"] = yahoo_error
+        if any(fallback.get(key) is not None for key in fundamental_keys):
+            return fallback
+
+        fallback["_retrieval_error"] = f"{yahoo_error} Fallback status: {fallback.get('_retrieval_error')}"
+        return fallback
 
 
 class NewsSpecialistAgent:
@@ -380,6 +494,7 @@ with st.sidebar:
     run_button = st.button("Run investment research", type="primary", use_container_width=True)
     st.divider()
     st.caption("Market/news data is retrieved at run time and may be missing or delayed.")
+    st.caption("For the fundamentals fallback, configure FMP_API_KEY in Streamlit Secrets.")
 
 if run_button:
     if not ticker or not ticker.replace(".", "").isalnum():
@@ -418,19 +533,26 @@ if result:
         fig.update_layout(xaxis_title="Date", yaxis_title="Price", legend_title="Series", margin=dict(l=10, r=10, t=20, b=10), height=400)
         st.plotly_chart(fig, use_container_width=True)
 
+    st.caption(f"Company fundamentals source: {financials.get('_data_source', 'Unknown')}")
     if financials.get("_retrieval_error"):
         st.warning(
-            "Company fundamentals could not be retrieved from Yahoo Finance. "
-            "This is a data-source/retrieval issue, not a formatting issue. "
+            "Company fundamentals are unavailable from the configured data sources. "
+            "This is a data-retrieval issue, not a formatting issue. "
             + financials["_retrieval_error"]
         )
+    if financials.get("_partial_data_note"):
+        st.info(financials["_partial_data_note"])
+    if financials.get("_retrieval_error") or financials.get("_yahoo_error"):
         with st.expander("Company-data diagnostic details"):
+            if financials.get("_yahoo_error"):
+                st.write("Yahoo Finance result:")
+                st.code(financials["_yahoo_error"])
             available_keys = financials.get("_available_info_keys", [])
             if available_keys:
-                st.write("Keys returned by Yahoo Finance:")
+                st.write("Fields returned by the selected fallback provider:")
                 st.code(", ".join(available_keys[:100]))
-            else:
-                st.write("Yahoo Finance returned no usable company-information keys.")
+            elif not financials.get("_yahoo_error"):
+                st.write("No usable company-information fields were returned.")
 
     with st.expander("Company financial metrics", expanded=True):
         display_metrics = {
