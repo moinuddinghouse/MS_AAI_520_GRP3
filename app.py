@@ -502,11 +502,54 @@ if result:
     history = result["history"].copy().sort_index()
     history = history[~history.index.duplicated(keep="last")]
     close = history["Close"].dropna()
+    # Normalize timestamps, remove invalid/duplicate dates, and explicitly constrain
+    # the x-axis to the observed data range. This prevents the chart from showing
+    # misleading empty months beyond the selected history period.
+    close.index = pd.to_datetime(close.index, errors="coerce")
+    close = close[~close.index.isna()]
+    close = close[~close.index.duplicated(keep="last")].sort_index()
+
     chart_data = pd.DataFrame(index=close.index)
     chart_data["Closing price"] = close
     chart_data["50-day SMA"] = close.rolling(window=50, min_periods=50).mean()
     chart_data["200-day SMA"] = close.rolling(window=200, min_periods=200).mean()
-    st.line_chart(chart_data, x_label="Date", y_label="Price")
+    chart_data = chart_data.replace([np.inf, -np.inf], np.nan)
+    chart_data = chart_data.dropna(subset=["Closing price"])
+
+    # Plotly provides explicit control over the date axis range and tick formatting.
+    try:
+        import plotly.graph_objects as go
+
+        fig = go.Figure()
+        for column in ["Closing price", "50-day SMA", "200-day SMA"]:
+            fig.add_trace(go.Scatter(
+                x=chart_data.index,
+                y=chart_data[column],
+                mode="lines",
+                name=column,
+                connectgaps=False,
+            ))
+        start_date = chart_data.index.min()
+        end_date = chart_data.index.max()
+        fig.update_layout(
+            title="Historical Price and Moving Averages",
+            xaxis_title="Date",
+            yaxis_title="Price",
+            template="plotly_dark",
+            legend=dict(orientation="h", yanchor="top", y=-0.2),
+            margin=dict(b=90),
+        )
+        fig.update_xaxes(
+            type="date",
+            range=[start_date.isoformat(), end_date.isoformat()],
+            tickformat="%b %Y",
+            rangeslider_visible=False,
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption(f"Chart dates: {start_date:%d %b %Y} – {end_date:%d %b %Y}")
+    except ImportError:
+        st.warning("Plotly is not installed. Showing the basic chart instead.")
+        st.line_chart(chart_data, x_label="Date", y_label="Price")
     tech_rows = [
         {"Indicator": "50-day SMA", "Value": metrics.get("sma50")},
         {"Indicator": "200-day SMA", "Value": metrics.get("sma200")},
