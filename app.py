@@ -135,7 +135,12 @@ class BaseAgent:
         self.name = name
 
     def _gemini(self, prompt: str) -> str | None:
-        """Return a Gemini response when configured; otherwise return None."""
+        """Call Gemini only while available; stop retrying after quota errors in this session."""
+        # A 429 quota error applies to the project/model, not just this specialist.
+        # Remember it for this Streamlit session to prevent repeated failing calls.
+        if st.session_state.get("gemini_quota_exhausted", False):
+            return None
+
         api_key = st.secrets.get("GOOGLE_API_KEY", os.getenv("GOOGLE_API_KEY", ""))
         if not api_key or ChatGoogleGenerativeAI is None:
             return None
@@ -148,7 +153,28 @@ class BaseAgent:
             response = llm.invoke([HumanMessage(content=prompt)])
             return str(response.content)
         except Exception as exc:
-            st.warning(f"{self.name}: Gemini was unavailable; using fallback summary. ({exc})")
+            error_text = str(exc)
+            is_quota_error = (
+                "429" in error_text
+                or "RESOURCE_EXHAUSTED" in error_text.upper()
+                or "quota exceeded" in error_text.lower()
+            )
+            if is_quota_error:
+                st.session_state["gemini_quota_exhausted"] = True
+                if not st.session_state.get("gemini_quota_warning_shown", False):
+                    st.warning(
+                        "Gemini API quota is exhausted. The app will use built-in "
+                        "fallback analysis for the rest of this session and will not "
+                        "keep retrying Gemini. Check Google AI Studio quotas or try "
+                        "again after the reset."
+                    )
+                    st.session_state["gemini_quota_warning_shown"] = True
+            elif not st.session_state.get("gemini_unavailable_warning_shown", False):
+                st.warning(
+                    "Gemini is unavailable; the app will continue with fallback analysis. "
+                    "Check the model name and API key if this persists."
+                )
+                st.session_state["gemini_unavailable_warning_shown"] = True
             return None
 
 
