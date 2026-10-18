@@ -1,304 +1,537 @@
-"""Streamlit companion app for the Multi-Agent Financial Analysis System."""
-from datetime import datetime, timezone
+"""
+Multi-Agent Investment Research System — Streamlit demo.
+
+This app uses Yahoo Finance for market/fundamental data and optionally Google
+Gemini for narrative analysis. If Gemini is unavailable, it falls back to
+deterministic summaries. Sample articles are clearly marked as illustrative
+and are never represented as live news.
+"""
+from __future__ import annotations
+
 import os
+import json
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 
-st.set_page_config(page_title="Multi-Agent Financial Analysis", page_icon="📈", layout="wide")
-st.title("📈 Multi-Agent Financial Analysis System")
-st.caption("Research Manager → Market Specialist → Earnings Specialist → News Specialist → Evaluator–Optimizer")
+try:
+    import matplotlib.pyplot as plt
+except ImportError:
+    plt = None
+
+try:
+    from langchain_google_genai import ChatGoogleGenerativeAI
+    from langchain_core.messages import HumanMessage
+except ImportError:
+    ChatGoogleGenerativeAI = None
+    HumanMessage = None
 
 
-def number(value, prefix="", suffix="", digits=2):
+APP_DIR = Path(__file__).resolve().parent
+MEMORY_PATH = APP_DIR / "research_memory.json"
+
+
+# ---------- Data retrieval ----------
+def fetch_market_data(ticker: str) -> dict[str, Any]:
+    """Fetch recent price history and available company fundamentals."""
+    stock = yf.Ticker(ticker)
+    history = stock.history(period="1y", auto_adjust=True)
+    if history is None or history.empty:
+        raise ValueError(
+            f"No price history was returned for {ticker}. Check the symbol "
+            "and try again."
+        )
+
+    info: dict[str, Any] = {}
     try:
-        if value is None or pd.isna(value):
-            return "N/A"
-        return f"{prefix}{float(value):,.{digits}f}{suffix}"
-    except (TypeError, ValueError):
-        return "N/A"
+        info = stock.info or {}
+    except Exception:
+        # Yahoo Finance may rate-limit or omit fundamentals; prices can still work.
+        info = {}
 
-
-def get_news(stock, ticker, limit=10):
-    rows, diagnostics = [], []
-    try:
-        for item in (stock.news or []):
-            content = item.get("content", item)
-            if not isinstance(content, dict):
-                content = item
-            provider = content.get("provider", {})
-            publisher = provider.get("displayName", "Yahoo Finance") if isinstance(provider, dict) else "Yahoo Finance"
-            canonical = content.get("canonicalUrl", {})
-            link = canonical.get("url", "") if isinstance(canonical, dict) else item.get("link", "")
-            title = content.get("title") or item.get("title")
-            if title:
-                rows.append({"Title": title, "Publisher": publisher, "Published": content.get("pubDate", ""), "Link": link, "Source": "Yahoo Finance"})
-    except Exception as exc:
-        diagnostics.append(f"Yahoo Finance news unavailable: {exc}")
-    if not rows:
-        try:
-            q = urllib.parse.quote(f"{ticker} stock company finance")
-            url = f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=8) as response:
-                root = ET.fromstring(response.read())
-            channel = root.find("channel")
-            if channel is not None:
-                for item in channel.findall("item"):
-                    title = item.findtext("title", "")
-                    if title:
-                        source = item.find("source")
-                        rows.append({"Title": title, "Publisher": source.text if source is not None else "Google News", "Published": item.findtext("pubDate", ""), "Link": item.findtext("link", ""), "Source": "Google News RSS"})
-        except Exception as exc:
-            diagnostics.append(f"Google News RSS fallback unavailable: {exc}")
-    unique, seen = [], set()
-    for row in rows:
-        key = row["Title"].strip().lower()
-        if key and key not in seen:
-            unique.append(row)
-            seen.add(key)
-    return pd.DataFrame(unique[:limit]), diagnostics
-
-
-def market_specialist(history):
-    if history.empty or "Close" not in history:
-        return {"error": "No historical market data was returned."}
     close = history["Close"].dropna()
-    if close.empty:
-        return {"error": "No valid closing prices were returned."}
     returns = close.pct_change().dropna()
-    ma20 = close.rolling(20).mean().iloc[-1] if len(close) >= 20 else None
-    ma50 = close.rolling(50).mean().iloc[-1] if len(close) >= 50 else None
-    latest = float(close.iloc[-1])
-    return {
-        "start_price": float(close.iloc[0]), "latest_price": latest,
-        "period_return_pct": float((latest / float(close.iloc[0]) - 1) * 100),
-        "annualized_volatility_pct": float(returns.std() * np.sqrt(252) * 100) if len(returns) > 1 else None,
-        "ma20": float(ma20) if pd.notna(ma20) else None,
-        "ma50": float(ma50) if pd.notna(ma50) else None,
-        "max_price": float(close.max()), "min_price": float(close.min()),
-        "trend_signal": "Bullish" if ma20 is not None and latest > ma20 else ("Bearish" if ma20 is not None else "Insufficient data"),
-        "observations": len(close),
+    sma50 = close.rolling(50).mean()
+    sma200 = close.rolling(200).mean()
+    delta = close.diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    rs = gain / loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+
+    current_price = float(close.iloc[-1])
+    prior_price = float(close.iloc[-2]) if len(close) > 1 else current_price
+    metrics = {
+        "current_price": current_price,
+        "daily_change_pct": (
+            (current_price / prior_price - 1) * 100 if prior_price else 0.0
+        ),
+        "market_cap": info.get("marketCap"),
+        "pe_ratio": info.get("trailingPE"),
+        "revenue": info.get("totalRevenue"),
+        "net_income": info.get("netIncomeToCommon"),
+        "profit_margin": info.get("profitMargins"),
+        "fifty_two_week_high": info.get("fiftyTwoWeekHigh"),
+        "fifty_two_week_low": info.get("fiftyTwoWeekLow"),
+        "sma50": float(sma50.iloc[-1]) if pd.notna(sma50.iloc[-1]) else None,
+        "sma200": float(sma200.iloc[-1]) if pd.notna(sma200.iloc[-1]) else None,
+        "rsi14": float(rsi.iloc[-1]) if pd.notna(rsi.iloc[-1]) else None,
+        "annualized_volatility_pct": (
+            float(returns.std() * np.sqrt(252) * 100) if len(returns) > 1 else None
+        ),
+        "period_return_pct": (
+            float((close.iloc[-1] / close.iloc[0] - 1) * 100)
+            if len(close) > 1 else 0.0
+        ),
     }
+    return {"history": history, "metrics": metrics, "info": info}
 
 
-def make_report(ticker, market, info, news, prior_lesson):
-    company = info.get("longName") or ticker
-    lines = [f"# Investment Research Summary: {company} ({ticker})", "", "## Market specialist"]
-    if "error" in market:
-        lines.append(market["error"])
-    else:
-        lines += [
-            f"- Latest adjusted close: {number(market.get('latest_price'), '$')}",
-            f"- Period return: {number(market.get('period_return_pct'), suffix='%')}",
-            f"- Annualized historical volatility: {number(market.get('annualized_volatility_pct'), suffix='%')}",
-            f"- 20-day moving average: {number(market.get('ma20'), '$')}",
-            f"- 50-day moving average: {number(market.get('ma50'), '$')}",
-            f"- Trend heuristic: {market.get('trend_signal', 'N/A')}",
-        ]
-    lines += ["", "## Earnings / fundamentals specialist"]
-    lines += [
-        f"- Sector / industry: {info.get('sector') or 'N/A'} / {info.get('industry') or 'N/A'}",
-        f"- Market capitalization: {number(info.get('marketCap'), '$', digits=0)}",
-        f"- Trailing P/E: {number(info.get('trailingPE'))}",
-        f"- Forward P/E: {number(info.get('forwardPE'))}",
-        f"- Profit margin: {number((info.get('profitMargins') or 0) * 100, suffix='%') if info.get('profitMargins') is not None else 'N/A'}",
-        f"- Return on equity: {number((info.get('returnOnEquity') or 0) * 100, suffix='%') if info.get('returnOnEquity') is not None else 'N/A'}",
-        f"- Revenue growth: {number((info.get('revenueGrowth') or 0) * 100, suffix='%') if info.get('revenueGrowth') is not None else 'N/A'}",
-    ]
-    lines += ["", "## News specialist"]
-    if news.empty:
-        lines.append("No usable articles were returned by configured providers during this run. Current news sentiment cannot be assessed from missing data.")
-    else:
-        lines.extend([f"- {r['Title']} — {r['Publisher']}" for _, r in news.head(5).iterrows()])
-    lines += ["", "## Risk and limitations", "- Historical returns and technical indicators do not guarantee future performance.", "- Financial metrics and headlines may be delayed, incomplete, or revised by providers.", "- This is an educational research tool, not personalized financial advice.", f"- Prior session memory: {prior_lesson or 'No prior lesson for this ticker in the current session.'}"]
-    return "\n".join(lines)
-
-
-with st.sidebar:
-    st.header("Research configuration")
-    ticker = st.text_input("Stock ticker", "AAPL").strip().upper()
-    period = st.selectbox("Historical lookback", ["1mo", "3mo", "6mo", "1y", "2y", "5y"], index=3)
-    run = st.button("Run multi-agent analysis", type="primary", use_container_width=True)
-    st.caption("Yahoo Finance data; Google News RSS fallback for headlines.")
-    st.caption("Optional Gemini review can be enabled with GOOGLE_API_KEY in Streamlit Secrets.")
-
-if "memory" not in st.session_state:
-    st.session_state.memory = []
-if "result" not in st.session_state:
-    st.session_state.result = None
-
-if run:
-    if not ticker or any(c.isspace() for c in ticker):
-        st.error("Enter a ticker such as AAPL or MSFT.")
-        st.stop()
+def fetch_google_news_rss(ticker: str, limit: int = 8) -> list[dict[str, str]]:
+    """Try Google News RSS when Yahoo Finance returns no usable headlines."""
+    query = urllib.parse.quote(f"{ticker} stock company")
+    url = (
+        "https://news.google.com/rss/search?q="
+        f"{query}&hl=en-US&gl=US&ceid=US:en"
+    )
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; InvestmentResearchDemo/1.0)"},
+    )
     try:
-        with st.spinner(f"Research Manager coordinating specialists for {ticker}…"):
-            stock = yf.Ticker(ticker)
-            history = stock.history(period=period, auto_adjust=True)
-            try:
-                info = stock.info or {}
-            except Exception:
-                info = {}
-            market = market_specialist(history)
-            news, diagnostics = get_news(stock, ticker)
-            prior = next((x["lesson"] for x in reversed(st.session_state.memory) if x["ticker"] == ticker), None)
-            report = make_report(ticker, market, info, news, prior)
-            # Score actual evidence coverage, not merely whether a variable exists.
-            has_news_title = (
-                not news.empty and "Title" in news.columns
-                and news["Title"].fillna("").astype(str).str.strip().ne("").any()
+        with urllib.request.urlopen(request, timeout=8) as response:
+            xml_data = response.read()
+        root = ET.fromstring(xml_data)
+        items: list[dict[str, str]] = []
+        for item in root.findall("./channel/item")[:limit]:
+            title = item.findtext("title", default="").strip()
+            description = item.findtext("description", default="").strip()
+            link = item.findtext("link", default="").strip()
+            if title:
+                items.append({
+                    "title": title,
+                    "text": description or title,
+                    "category": "news",
+                    "source": "Google News RSS",
+                    "url": link,
+                })
+        return items
+    except Exception:
+        # Network access can be blocked on hosted platforms; keep fallback explicit.
+        return []
+
+
+# ---------- Specialist agents ----------
+class BaseAgent:
+    def __init__(self, name: str):
+        self.name = name
+
+    def _gemini(self, prompt: str) -> str | None:
+        """Return a Gemini response when configured; otherwise return None."""
+        api_key = st.secrets.get("GOOGLE_API_KEY", os.getenv("GOOGLE_API_KEY", ""))
+        if not api_key or ChatGoogleGenerativeAI is None:
+            return None
+        try:
+            llm = ChatGoogleGenerativeAI(
+                model="gemini-3.8-flash",
+                google_api_key=api_key,
+                temperature=0.2,
             )
-            has_news_link = (
-                not news.empty and "Link" in news.columns
-                and news["Link"].fillna("").astype(str).str.startswith("http").any()
-            )
-            fundamental_keys = ["marketCap", "trailingPE", "profitMargins", "returnOnEquity", "revenueGrowth"]
-            fundamental_coverage = sum(info.get(k) is not None for k in fundamental_keys)
-            news_failure_disclosed = "no usable articles" in report.lower() or "no usable headlines" in report.lower()
-            checks = {
-                "Market data coverage adequate (20+ observations)": (
-                    "error" not in market and market.get("latest_price") is not None
-                    and market.get("observations", 0) >= 20
-                ),
-                "Fundamental coverage adequate (3+ fields)": fundamental_coverage >= 3,
-                "Usable news evidence retrieved": has_news_title and has_news_link,
-                "Risk disclosure included": (
-                    "Risk and limitations" in report and "do not guarantee" in report.lower()
-                ),
-                "Missing evidence handled transparently": (
-                    (has_news_title and has_news_link) or news_failure_disclosed
-                ) and ("N/A" in report or "not available" in report.lower() or "Risk and limitations" in report),
-            }
-            score = round(sum(bool(v) for v in checks.values()) / len(checks) * 100)
-            st.session_state.result = {
-                "ticker": ticker, "period": period, "time": datetime.now(timezone.utc).isoformat(),
-                "history": history, "market": market, "info": info, "news": news,
-                "diagnostics": diagnostics, "report": report, "checks": checks, "score": score,
-            }
-            st.session_state.memory.append({"ticker": ticker, "timestamp": datetime.now(timezone.utc).isoformat(), "lesson": f"{ticker}: checklist {score}/100; news items {len(news)}; trend {market.get('trend_signal', 'N/A')}. Disclose missing evidence."})
-    except Exception as exc:
-        st.error(f"Research run failed: {exc}")
-        st.exception(exc)
+            response = llm.invoke([HumanMessage(content=prompt)])
+            return str(response.content)
+        except Exception as exc:
+            st.warning(f"{self.name}: Gemini was unavailable; using fallback summary. ({exc})")
+            return None
 
-r = st.session_state.result
-if r is None:
-    st.info("Choose a ticker in the sidebar and click **Run multi-agent analysis**.")
-    st.markdown("**Workflow**: Research Manager → Market / Earnings / News specialists → Evaluator–Optimizer → Report + session memory")
-    st.stop()
 
-m, info, news = r["market"], r["info"], r["news"]
-st.subheader(f"{info.get('longName') or r['ticker']} ({r['ticker']})")
-st.caption(f"Lookback: {r['period']} · Run time (UTC): {r['time']}")
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Latest adjusted close", number(m.get("latest_price"), "$"))
-c2.metric("Period return", number(m.get("period_return_pct"), suffix="%"))
-c3.metric("Annualized volatility", number(m.get("annualized_volatility_pct"), suffix="%"))
-c4.metric("Checklist score", f"{r['score']}/100", help="Completeness checklist, not a measure of investment accuracy.")
+class NewsSpecialistAgent(BaseAgent):
+    def analyze_article(self, article: dict[str, str]) -> dict[str, str]:
+        prompt = (
+            "You are a financial news analyst. Analyze the article below. "
+            "Return a concise summary, sentiment (positive/neutral/negative), "
+            "and possible market relevance. Do not invent facts.\n\n"
+            f"Title: {article['title']}\nText: {article['text']}"
+        )
+        answer = self._gemini(prompt)
+        if answer:
+            return {"specialist": self.name, "analysis": answer}
+        return {
+            "specialist": self.name,
+            "analysis": (
+                f"Illustrative article: {article['title']}. "
+                "Gemini is not configured; no independent sentiment conclusion "
+                "is asserted by the fallback."
+            ),
+        }
 
-# All sections are presented together as one consolidated report page (no separate tabs).
-st.markdown("## Executive research report")
-st.markdown("### 1. Executive summary")
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Latest adjusted close", number(m.get("latest_price"), "$"))
-c2.metric("Period return", number(m.get("period_return_pct"), suffix="%"))
-c3.metric("Annualized volatility", number(m.get("annualized_volatility_pct"), suffix="%"))
-c4.metric("Evidence checklist score", f"{r['score']}/100", help="Evidence completeness score, not investment accuracy.")
-st.markdown(r["report"])
-st.download_button(
-    "Download complete research report (.md)", r["report"],
-    file_name=f"{r['ticker']}_research_report.md", mime="text/markdown",
-    key="download_complete_report",
+
+class EarningsSpecialistAgent(BaseAgent):
+    def analyze_article(self, article: dict[str, str]) -> dict[str, str]:
+        prompt = (
+            "You are a fundamental/earnings analyst. Explain what the supplied "
+            "content says about revenue, profit, guidance, or financial results. "
+            "If no financial figures are provided, explicitly say so. Do not "
+            "invent facts.\n\n"
+            f"Title: {article['title']}\nText: {article['text']}"
+        )
+        answer = self._gemini(prompt)
+        if answer:
+            return {"specialist": self.name, "analysis": answer}
+        return {
+            "specialist": self.name,
+            "analysis": (
+                f"{article['title']}: the illustrative text contains no verified "
+                "financial statement data. Check official filings before drawing "
+                "fundamental conclusions."
+            ),
+        }
+
+
+class MarketSpecialistAgent(BaseAgent):
+    def analyze(self, ticker: str, metrics: dict[str, Any]) -> dict[str, Any]:
+        prompt = (
+            "You are a market/technical analyst. Summarize the supplied calculated "
+            "metrics. Distinguish data from interpretation; do not give personalized "
+            "financial advice.\n"
+            f"Ticker: {ticker}\nMetrics: {json.dumps(metrics, default=str)}"
+        )
+        answer = self._gemini(prompt)
+        trend = "unavailable"
+        if metrics.get("sma50") is not None and metrics.get("sma200") is not None:
+            trend = "above" if metrics["sma50"] > metrics["sma200"] else "below"
+        return {
+            "specialist": self.name,
+            "trend_signal": trend,
+            "analysis": answer or (
+                f"The 50-day SMA is {trend} the 200-day SMA where available. "
+                f"One-year price return: {metrics.get('period_return_pct', 0):.2f}%. "
+                "This is a descriptive indicator, not a forecast."
+            ),
+        }
+
+
+class EarningsSpecialist:
+    """Fundamental specialist for available Yahoo Finance company metrics."""
+    def __init__(self, name: str):
+        self.name = name
+
+    def analyze(self, info: dict[str, Any]) -> dict[str, Any]:
+        data = {
+            "revenue": info.get("totalRevenue"),
+            "net_income": info.get("netIncomeToCommon"),
+            "profit_margin": info.get("profitMargins"),
+            "trailing_PE": info.get("trailingPE"),
+            "debt_to_equity": info.get("debtToEquity"),
+        }
+        return {
+            "specialist": self.name,
+            "metrics": data,
+            "analysis": (
+                "Fundamental metrics are shown when Yahoo Finance provides them. "
+                "Unavailable values are left blank rather than estimated."
+            ),
+        }
+
+
+class RouterAgent(BaseAgent):
+    def __init__(self, name: str, news_agent: NewsSpecialistAgent,
+                 earnings_agent: EarningsSpecialistAgent,
+                 market_agent: MarketSpecialistAgent):
+        super().__init__(name)
+        self.news_agent = news_agent
+        self.earnings_agent = earnings_agent
+        self.market_agent = market_agent
+
+    def route_article(self, article: dict[str, str]) -> dict[str, str]:
+        category = article.get("category", "news").lower()
+        if category == "earnings":
+            result = self.earnings_agent.analyze_article(article)
+        else:
+            result = self.news_agent.analyze_article(article)
+        result["category"] = category
+        result["article_title"] = article["title"]
+        return result
+
+    def route_market(self, ticker: str, metrics: dict[str, Any]) -> dict[str, Any]:
+        return self.market_agent.analyze(ticker, metrics)
+
+
+# ---------- Workflow and memory ----------
+def load_memory() -> list[dict[str, Any]]:
+    try:
+        if MEMORY_PATH.exists():
+            data = json.loads(MEMORY_PATH.read_text(encoding="utf-8"))
+            return data if isinstance(data, list) else []
+    except Exception:
+        pass
+    return []
+
+
+def save_memory(record: dict[str, Any]) -> None:
+    history = load_memory()
+    history.append(record)
+    # Keep a small local demo history.
+    MEMORY_PATH.write_text(json.dumps(history[-50:], indent=2, default=str), encoding="utf-8")
+
+
+def evaluate_research(data: dict[str, Any], earnings_result: dict[str, Any],
+                      articles: list[dict[str, Any]], news_is_live: bool,
+                      market_result: dict[str, Any], report_text: str) -> dict[str, Any]:
+    """Evaluate evidence coverage and process quality, not investment accuracy."""
+    metrics = data["metrics"]
+    info = data["info"]
+    fundamentals = earnings_result["metrics"]
+    available_fundamentals = sum(v is not None for v in fundamentals.values())
+    usable_news = [a for a in articles if a.get("title") and a.get("source") != "Illustrative sample — not live news"]
+    shares = info.get("sharesOutstanding")
+    price = metrics.get("current_price")
+    market_cap = metrics.get("market_cap")
+    implied_cap = float(price) * float(shares) if price is not None and shares else None
+    cap_consistent = None
+    if market_cap and implied_cap:
+        cap_consistent = abs(float(market_cap) - implied_cap) / max(abs(float(market_cap)), 1) <= 0.15
+    trend_method_explained = "50-day SMA" in market_result.get("analysis", "") or "200-day SMA" in market_result.get("analysis", "") or market_result.get("trend_signal") != "unavailable"
+    checks = {
+        "Sufficient price history": not data["history"].empty and len(data["history"]) >= 20,
+        "Technical method is explicit": trend_method_explained and metrics.get("sma50") is not None,
+        "Fundamental evidence coverage": available_fundamentals >= 3,
+        "Usable live news evidence": news_is_live and len(usable_news) > 0,
+        "Market-cap cross-check": cap_consistent is True if cap_consistent is not None else False,
+        "Limitations and uncertainty disclosed": "Risk and limitations" in report_text and "do not guarantee" in report_text.lower(),
+        "Missing evidence handled transparently": (news_is_live or "no usable news articles" in report_text.lower() or "news unavailable" in report_text.lower()) and ("N/A" in report_text or "not available" in report_text.lower()),
+    }
+    passed = sum(bool(v) for v in checks.values())
+    feedback = []
+    if not checks["Technical method is explicit"]:
+        feedback.append("State the trend rule explicitly (for example, 50-day SMA compared with 200-day SMA).")
+    if not checks["Fundamental evidence coverage"]:
+        feedback.append("Limited fundamentals are available; avoid strong conclusions and verify company filings.")
+    if not checks["Usable live news evidence"]:
+        feedback.append("Live news evidence is missing or sample-only; do not present illustrative items as current news.")
+    if not checks["Market-cap cross-check"]:
+        feedback.append("Market capitalisation could not be independently cross-checked against price × shares outstanding, or the values differ by more than 15%.")
+    feedback.append("This score measures evidence and process coverage, not prediction accuracy or investment quality.")
+    return {"score": round(100 * passed / len(checks)), "checks": checks, "passed": passed, "total": len(checks),
+            "available_fundamental_fields": available_fundamentals, "implied_market_cap": implied_cap, "market_cap_consistent": cap_consistent, "feedback": feedback}
+
+
+def run_research(ticker: str, use_sample_articles: bool) -> dict[str, Any]:
+    ticker = ticker.strip().upper()
+    data = fetch_market_data(ticker)
+
+    news_agent = NewsSpecialistAgent("News Specialist")
+    earnings_article_agent = NewsSpecialistAgent("Earnings Specialist")
+    market_agent = MarketSpecialistAgent("Market Specialist")
+    earnings_agent = EarningsSpecialist("Earnings Specialist")
+    router = RouterAgent("Router", news_agent, earnings_article_agent, market_agent)
+
+    # Yahoo Finance news is attempted; examples are explicitly illustrative.
+    raw_news: list[dict[str, Any]] = []
+    try:
+        raw_news = yf.Ticker(ticker).news or []
+    except Exception:
+        raw_news = []
+
+    articles: list[dict[str, str]] = []
+    for item in raw_news:
+        content = item.get("content", item)
+        title = content.get("title") or item.get("title")
+        summary = content.get("summary") or item.get("summary") or ""
+        if title:
+            articles.append({
+                "title": str(title),
+                "text": str(summary),
+                "category": "news",
+                "source": "Yahoo Finance",
+            })
+
+    news_is_live = bool(articles)
+    if not articles:
+        # Secondary live source: Google News RSS. It may also be unavailable
+        # when the deployment environment blocks external requests.
+        articles = fetch_google_news_rss(ticker)
+        news_is_live = bool(articles)
+
+    if not articles and use_sample_articles:
+        articles = [
+            {
+                "title": "Illustrative earnings update",
+                "text": "Hypothetical example only: a company reports revenue growth but provides no verified figures.",
+                "category": "earnings",
+                "source": "Illustrative sample — not live news",
+            },
+            {
+                "title": "Illustrative market commentary",
+                "text": "Hypothetical example only: market participants discuss recent price volatility.",
+                "category": "news",
+                "source": "Illustrative sample — not live news",
+            },
+        ]
+
+    routed_articles = [router.route_article(article) for article in articles]
+    market_result = router.route_market(ticker, data["metrics"])
+    earnings_result = earnings_agent.analyze(data["info"])
+
+    # Build a compact report text first, then evaluate evidence coverage.
+    report_text = (
+        "Risk and limitations: data may be delayed or incomplete; historical indicators do not guarantee future results. "
+        "Unavailable values are marked N/A. "
+        + ("No usable news articles were retrieved." if not news_is_live else "Live news was retrieved.")
+    )
+    evaluation = evaluate_research(data, earnings_result, articles, news_is_live, market_result, report_text)
+    final_report = {
+        "ticker": ticker,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "metrics": data["metrics"],
+        "market_analysis": market_result,
+        "fundamental_analysis": earnings_result,
+        "routed_articles": routed_articles,
+        "live_news_available": news_is_live,
+        "evaluation": evaluation,
+        "report_text": report_text,
+        "limitations": [
+            "Market data is provided by Yahoo Finance and may be delayed or incomplete.",
+            "Illustrative articles are not real financial news.",
+            "This application is for educational research, not investment advice.",
+        ],
+    }
+    save_memory({
+        "ticker": ticker,
+        "generated_at": final_report["generated_at"],
+        "score": evaluation["score"],
+        "live_news_available": news_is_live,
+    })
+    return {"report": final_report, "history": data["history"], "info": data["info"]}
+
+
+# ---------- Streamlit UI ----------
+st.set_page_config(page_title="Multi-Agent Investment Research", page_icon="📈", layout="wide")
+st.title("📈 Multi-Agent Investment Research System")
+st.caption("Research orchestrator · News specialist · Earnings specialist · Market specialist · Evaluator")
+st.info(
+    "Educational demonstration only. Market data may be delayed or incomplete. "
+    "This app does not provide personalized investment advice."
 )
 
-st.divider()
-st.markdown("### 2. Market analysis")
-history = r["history"]
-if not history.empty:
-    chart = history.copy()
-    chart["MA20"] = chart["Close"].rolling(20).mean()
-    chart["MA50"] = chart["Close"].rolling(50).mean()
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=chart.index, y=chart["Close"], name="Adjusted close"))
-    fig.add_trace(go.Scatter(x=chart.index, y=chart["MA20"], name="20-day MA"))
-    fig.add_trace(go.Scatter(x=chart.index, y=chart["MA50"], name="50-day MA"))
-    fig.update_layout(title=f"{r['ticker']} price and moving averages", xaxis_title="Date", yaxis_title="Price", hovermode="x unified")
-    st.plotly_chart(fig, use_container_width=True)
-    st.dataframe(history.tail(20), use_container_width=True)
-else:
-    st.warning("No market history returned.")
-with st.expander("Market specialist details", expanded=False):
-    st.json(m)
+with st.sidebar:
+    st.header("Research settings")
+    ticker_input = st.text_input("Stock symbol", value="AAPL", max_chars=12).strip().upper()
+    use_sample_articles = st.checkbox(
+        "Use clearly labelled sample articles if live news is unavailable",
+        value=True,
+    )
+    st.caption("Live news is only reported when the Yahoo Finance provider returns articles.")
+    run_button = st.button("Run research", type="primary", width="stretch")
+    st.divider()
+    st.markdown("**Data sources**")
+    st.markdown("- Yahoo Finance (prices/fundamentals/news)\n- Google Gemini (optional narrative analysis)")
 
-st.divider()
-st.markdown("### 3. Earnings and fundamental analysis")
-cols = st.columns(3)
-metrics = [("Market cap", "marketCap", "money"), ("Trailing P/E", "trailingPE", "num"), ("Forward P/E", "forwardPE", "num"), ("Profit margin", "profitMargins", "pct"), ("Operating margin", "operatingMargins", "pct"), ("Return on equity", "returnOnEquity", "pct"), ("Revenue growth", "revenueGrowth", "pct"), ("Debt-to-equity", "debtToEquity", "num"), ("Beta", "beta", "num")]
-for i, (label, key, kind) in enumerate(metrics):
-    v = info.get(key)
-    if kind == "money": value = number(v, "$", digits=0)
-    elif kind == "pct": value = number(v * 100, suffix="%") if v is not None else "N/A"
-    else: value = number(v)
-    cols[i % 3].metric(label, value)
-st.write("**Company:**", info.get("longName") or r["ticker"])
-st.write("**Sector:**", info.get("sector") or "N/A", " | **Industry:**", info.get("industry") or "N/A")
-st.caption("Provider fields may be missing, delayed, or revised.")
-
-st.divider()
-st.markdown("### 4. News evidence and specialist routing")
-st.markdown("**Routing:** Research Manager → News Specialist → Report synthesis → Evaluator")
-if news.empty:
-    st.warning("No usable headlines were returned. Do not infer current sentiment from missing data.")
-    for msg in r["diagnostics"]:
-        st.caption(msg)
-else:
-    for _, row in news.iterrows():
-        title = str(row["Title"])
-        link = str(row.get("Link", ""))
-        st.markdown(f"**[{title}]({link})**" if link.startswith("http") else f"**{title}**")
-        st.caption(f"{row['Publisher']} · {row['Published']} · {row['Source']}")
-        st.divider()
-
-st.divider()
-st.markdown("### 5. Evaluator–optimizer checklist")
-st.metric("Evidence completeness", f"{r['score']}/100", help="This is not a measure of investment prediction accuracy.")
-passed = sum(bool(v) for v in r["checks"].values())
-st.caption(f"{passed} of {len(r['checks'])} checks passed. Failed checks indicate missing evidence or insufficient data coverage.")
-for name, passed_check in r["checks"].items():
-    st.write(("✅ " if passed_check else "⚠️ ") + name)
-
-st.divider()
-st.markdown("### 6. Session memory and execution record")
-st.caption("Memory is held in the current Streamlit session; it may not persist across sessions or server restarts.")
-st.dataframe(pd.DataFrame(st.session_state.memory), use_container_width=True)
-
-if st.button("Optional Gemini report review"):
-    api_key = None
-    try:
-        api_key = st.secrets.get("GOOGLE_API_KEY")
-    except Exception:
-        api_key = os.getenv("GOOGLE_API_KEY")
-    if not api_key:
-        st.warning("Add GOOGLE_API_KEY under Streamlit app Settings → Secrets to enable Gemini review.")
+if run_button:
+    if not ticker_input or not ticker_input.replace(".", "").replace("-", "").isalnum():
+        st.error("Enter a valid ticker symbol, such as AAPL or MSFT.")
     else:
-        try:
-            from google import genai
-            client = genai.Client(api_key=api_key)
-            with st.spinner("Reviewing report with Gemini…"):
-                response = client.models.generate_content(
-                    model="gemini-2.5-flash",
-                    contents="Review this educational financial research report for missing caveats and unsupported claims. Do not make buy/sell recommendations. Be concise.\n\n" + r["report"],
+        with st.spinner(f"Researching {ticker_input}..."):
+            try:
+                st.session_state["research_result"] = run_research(
+                    ticker_input, use_sample_articles
                 )
-            st.markdown("### Gemini review")
-            st.write(response.text)
-        except Exception as exc:
-            st.warning(f"Gemini review unavailable: {exc}")
+            except Exception as exc:
+                st.error(f"Research failed: {exc}")
+                st.stop()
 
-st.divider()
-st.caption("Educational research only; not personalized financial advice. Validate data independently before making financial decisions.")
+result = st.session_state.get("research_result")
+if result:
+    report = result["report"]
+    metrics = report["metrics"]
+    evaluation = report["evaluation"]
+
+    st.subheader(f"Research report: {report['ticker']}")
+    st.caption(f"Generated {report['generated_at']} · Sources: Yahoo Finance; Google News RSS fallback · Gemini is optional")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Latest price", f"{metrics['current_price']:,.2f}", f"{metrics['daily_change_pct']:+.2f}%")
+    c2.metric("1-year return", f"{metrics['period_return_pct']:+.2f}%")
+    c3.metric("Annualized volatility", f"{metrics['annualized_volatility_pct']:.2f}%" if metrics['annualized_volatility_pct'] is not None else "N/A")
+    c4.metric("Evidence coverage", f"{evaluation['score']}/100", f"{evaluation['passed']}/{evaluation['total']} checks")
+
+    st.markdown("## 1. Executive summary")
+    trend = report["market_analysis"].get("trend_signal", "unavailable")
+    st.write(f"For **{report['ticker']}**, the latest available adjusted close is **{metrics['current_price']:,.2f}** and the one-year price return is **{metrics['period_return_pct']:+.2f}%**. The technical specialist reports the 50-day SMA as **{trend}** the 200-day SMA where both are available. This is a historical indicator, not a forecast or recommendation.")
+    st.caption("Interpretation rule: the trend signal compares the 50-day simple moving average (SMA) with the 200-day SMA. ‘Above’ is a positive long/short moving-average configuration; it does not establish future performance.")
+
+    st.markdown("## 2. Market analysis")
+    chart_data = result["history"]["Close"].dropna()
+    st.line_chart(chart_data, x_label="Date", y_label="Adjusted close")
+    tech_rows = [
+        {"Indicator": "50-day SMA", "Value": metrics.get("sma50")},
+        {"Indicator": "200-day SMA", "Value": metrics.get("sma200")},
+        {"Indicator": "RSI (14)", "Value": metrics.get("rsi14")},
+        {"Indicator": "52-week high", "Value": metrics.get("fifty_two_week_high")},
+        {"Indicator": "52-week low", "Value": metrics.get("fifty_two_week_low")},
+    ]
+    st.dataframe(pd.DataFrame(tech_rows), width="stretch", hide_index=True)
+    st.write(report["market_analysis"]["analysis"])
+
+    st.markdown("## 3. Fundamentals and valuation context")
+    fundamentals = report["fundamental_analysis"]["metrics"]
+    fundamental_rows = [{"Metric": k.replace("_", " ").title(), "Value": (f"{v:.2%}" if isinstance(v, (float, np.floating)) and k == "profit_margin" else (f"{v:,.2f}" if isinstance(v, (int, float, np.integer, np.floating)) else "N/A"))} for k, v in fundamentals.items()]
+    st.dataframe(pd.DataFrame(fundamental_rows), width="stretch", hide_index=True)
+    st.write("These figures are company-level snapshots from the data provider. The app does not currently calculate peer-group or historical valuation percentiles, so ratios should not be labelled cheap or expensive without additional comparison data.")
+    cap = metrics.get("market_cap")
+    implied = evaluation.get("implied_market_cap")
+    if cap is not None:
+        st.write(f"Reported market capitalisation: **{cap:,.0f}**")
+        if implied is not None:
+            st.write(f"Cross-check (latest price × shares outstanding): **{implied:,.0f}**")
+            if evaluation.get("market_cap_consistent"):
+                st.success("Market-cap cross-check is within 15%.")
+            else:
+                st.warning("Market-cap cross-check is unavailable or differs by more than 15%; verify source timestamps and share-count definitions.")
+        else:
+            st.info("Market-cap cross-check unavailable because shares outstanding were not provided.")
+
+    st.markdown("## 4. News evidence and synthesis")
+    if report["live_news_available"]:
+        st.success("Live headlines retrieved. Headlines are evidence to inspect, not proof of causal market impact.")
+        titles = [a.get("article_title", "") for a in report["routed_articles"] if a.get("article_title")]
+        if titles:
+            st.write(f"Retrieved **{len(titles)}** article(s). The list below is a source-level summary; the app does not claim a quantified sentiment trend unless an analysis model is configured.")
+            for article in report["routed_articles"]:
+                with st.expander(f"{article['specialist']} · {article['article_title']}"):
+                    st.caption(f"Category: {article['category']}")
+                    st.write(article["analysis"])
+    else:
+        st.warning("No live headlines were retrieved. Any sample articles are illustrative only and must not be treated as current news.")
+        for article in report["routed_articles"]:
+            with st.expander(f"{article['specialist']} · {article['article_title']}"):
+                st.caption("Illustrative sample — not live news")
+                st.write(article["analysis"])
+
+    st.markdown("## 5. Evaluator–optimizer review")
+    st.write("**Evidence coverage score — not model accuracy:** the score reflects whether key evidence and quality checks passed, not whether a stock prediction is correct.")
+    st.progress(evaluation["score"] / 100)
+    st.write(f"**{evaluation['passed']} of {evaluation['total']} checks passed**")
+    st.dataframe(pd.DataFrame([{"Check": k, "Passed": bool(v)} for k, v in evaluation["checks"].items()]), width="stretch", hide_index=True)
+    for item in evaluation["feedback"]:
+        st.write(f"- {item}")
+
+    st.markdown("## 6. Research memory")
+    memory = load_memory()
+    if memory:
+        st.dataframe(pd.DataFrame(memory[::-1]), width="stretch", hide_index=True)
+    else:
+        st.caption("No saved research runs yet.")
+    st.caption("Memory is stored in a local JSON file when the host filesystem permits it; on Streamlit Community Cloud it may not persist across restarts.")
+
+    st.markdown("## 7. Limitations")
+    st.markdown("- Market data and fundamentals may be delayed, incomplete, or rate-limited.\n- News retrieval and coverage vary by ticker and source.\n- No peer valuation comparison or validated predictive backtest is included.\n- Historical returns and technical indicators do not guarantee future results.\n- This educational application is not personalized investment advice.")
+    st.download_button("Download full research report (JSON)", data=json.dumps(report, indent=2, default=str), file_name=f"{report['ticker']}_research_report.json", mime="application/json")
+else:
+    st.markdown("Enter a stock ticker in the sidebar and click **Run research** to generate the full report.")

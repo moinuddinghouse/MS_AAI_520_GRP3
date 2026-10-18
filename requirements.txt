@@ -1,6 +1,6 @@
-streamlit>=1.39,<2
+streamlit>=1.40,<2
 yfinance>=0.2.50
-pandas>=2.1
-numpy>=1.26,<3
-plotly>=5.24
-google-genai>=1.0
+pandas>=2.0
+numpy>=1.26
+langchain-google-genai>=2.0
+langchain-core>=0.3
