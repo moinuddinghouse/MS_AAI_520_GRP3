@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import requests
 
@@ -462,9 +462,93 @@ class OptimizerAgent:
         return result
 
 
+def _get_fmp_api_key() -> str | None:
+    """Read FMP key from Streamlit Secrets or environment variables."""
+    key = os.getenv("FMP_API_KEY", "").strip()
+    try:
+        key = (st.secrets.get("FMP_API_KEY", "") or key).strip()
+    except Exception:
+        pass
+    return key or None
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def get_history(ticker: str, period: str) -> pd.DataFrame:
-    return yf.Ticker(ticker).history(period=period, auto_adjust=True)
+    """Get daily prices from Yahoo first, then use FMP if Yahoo rejects the request."""
+    yahoo_error = None
+    try:
+        history = yf.Ticker(ticker).history(period=period, auto_adjust=True)
+        if history is not None and not history.empty and "Close" in history:
+            history = history.dropna(subset=["Close"]).copy()
+            history.attrs["data_source"] = "Yahoo Finance"
+            history.attrs["retrieval_error"] = None
+            if not history.empty:
+                return history
+        yahoo_error = "Yahoo Finance returned no usable historical prices."
+    except Exception as exc:
+        yahoo_error = f"Yahoo Finance history request failed: {type(exc).__name__}."
+
+    api_key = _get_fmp_api_key()
+    if not api_key:
+        empty = pd.DataFrame(columns=["Close"])
+        empty.attrs["data_source"] = "Unavailable"
+        empty.attrs["retrieval_error"] = (
+            f"{yahoo_error} FMP fallback is not configured; add FMP_API_KEY to Streamlit Secrets."
+        )
+        return empty
+
+    days_by_period = {"1mo": 31, "3mo": 93, "6mo": 186, "1y": 366, "2y": 732, "5y": 1830}
+    end_date = datetime.now(timezone.utc).date()
+    start_date = end_date - timedelta(days=days_by_period.get(period, 186))
+    try:
+        response = requests.get(
+            "https://financialmodelingprep.com/stable/historical-price-eod/full",
+            params={
+                "symbol": ticker,
+                "from": start_date.isoformat(),
+                "to": end_date.isoformat(),
+                "apikey": api_key,
+            },
+            timeout=20,
+        )
+        if response.status_code != 200:
+            detail = f"FMP historical-price endpoint returned HTTP {response.status_code}; the endpoint may be restricted by your API plan."
+            empty = pd.DataFrame(columns=["Close"])
+            empty.attrs["data_source"] = "Unavailable"
+            empty.attrs["retrieval_error"] = f"{yahoo_error} {detail}"
+            return empty
+        payload = response.json()
+        if isinstance(payload, dict):
+            message = payload.get("Error Message") or payload.get("Error") or payload.get("message")
+            payload = []
+            detail = f"FMP returned an API error: {message}" if message else "FMP returned an unexpected response format."
+        else:
+            detail = "FMP returned no historical price records."
+        if isinstance(payload, list) and payload:
+            frame = pd.DataFrame(payload)
+            date_col = "date" if "date" in frame.columns else None
+            close_col = "close" if "close" in frame.columns else ("price" if "price" in frame.columns else None)
+            if date_col and close_col:
+                frame[date_col] = pd.to_datetime(frame[date_col], errors="coerce")
+                frame[close_col] = pd.to_numeric(frame[close_col], errors="coerce")
+                frame = frame.dropna(subset=[date_col, close_col]).sort_values(date_col)
+                frame = frame.set_index(date_col)
+                frame.index.name = "Date"
+                frame = frame.rename(columns={close_col: "Close"})
+                if not frame.empty:
+                    frame.attrs["data_source"] = "Financial Modeling Prep"
+                    frame.attrs["retrieval_error"] = None
+                    return frame
+                detail = "FMP price records did not contain valid date/close values."
+        empty = pd.DataFrame(columns=["Close"])
+        empty.attrs["data_source"] = "Unavailable"
+        empty.attrs["retrieval_error"] = f"{yahoo_error} {detail}"
+        return empty
+    except (requests.RequestException, ValueError, TypeError) as exc:
+        empty = pd.DataFrame(columns=["Close"])
+        empty.attrs["data_source"] = "Unavailable"
+        empty.attrs["retrieval_error"] = f"{yahoo_error} FMP history fallback failed: {type(exc).__name__}."
+        return empty
 
 
 def load_memory() -> list[dict]:
@@ -494,6 +578,8 @@ def run_research(ticker: str, period: str) -> dict:
     optimizer = OptimizerAgent()
 
     history = get_history(ticker, period)
+    history_source = history.attrs.get("data_source", "Unknown")
+    history_retrieval_error = history.attrs.get("retrieval_error")
     market = router.dispatch("market", history, market_agent, earnings_agent, news_agent)
     financials = router.dispatch("earnings", ticker, market_agent, earnings_agent, news_agent)
     raw_news = news_agent.ingest(ticker)
@@ -544,6 +630,8 @@ MEMORY
         "ticker": ticker,
         "period": period,
         "history": history,
+        "history_source": history_source,
+        "history_retrieval_error": history_retrieval_error,
         "market": market,
         "financials": financials,
         "news": articles,
@@ -603,6 +691,10 @@ if result:
     history = result["history"]
 
     st.subheader(f"Research results: {result['ticker']}")
+    st.caption(f"Historical price source: {result.get('history_source', 'Unknown')}")
+    if result.get("history_retrieval_error"):
+        with st.expander("Historical-price diagnostic details"):
+            st.write(result["history_retrieval_error"])
     if "error" in market:
         st.warning(market["error"])
     else:
