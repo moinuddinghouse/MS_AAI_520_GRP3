@@ -135,10 +135,13 @@ class BaseAgent:
         self.name = name
 
     def _gemini(self, prompt: str) -> str | None:
-        """Call Gemini if available; suppress repeated quota failures for this session."""
+        """Call Gemini when configured; suppress repeated quota failures per session."""
         if st.session_state.get("gemini_quota_exhausted", False):
             return None
-        api_key = st.secrets.get("GOOGLE_API_KEY", os.getenv("GOOGLE_API_KEY", ""))
+        try:
+            api_key = st.secrets.get("GOOGLE_API_KEY", os.getenv("GOOGLE_API_KEY", ""))
+        except Exception:
+            api_key = os.getenv("GOOGLE_API_KEY", "")
         if not api_key or ChatGoogleGenerativeAI is None:
             return None
         try:
@@ -152,16 +155,13 @@ class BaseAgent:
             return str(response.content)
         except Exception as exc:
             message = str(exc).lower()
-            is_quota_error = any(token in message for token in (
-                "resource_exhausted", "429", "quota exceeded", "rate limit"
-            ))
-            if is_quota_error:
+            if any(token in message for token in ("resource_exhausted", "429", "quota", "rate limit")):
                 st.session_state["gemini_quota_exhausted"] = True
                 if not st.session_state.get("gemini_quota_warning_shown", False):
-                    st.warning("Gemini quota is exhausted. Using built-in summaries for the rest of this session.")
+                    st.info("Gemini quota is exhausted. Using built-in summaries for the rest of this session.")
                     st.session_state["gemini_quota_warning_shown"] = True
             elif not st.session_state.get("gemini_unavailable_warning_shown", False):
-                st.info("Gemini is temporarily unavailable. Using built-in summaries instead.")
+                st.info("Gemini is unavailable. Using built-in summaries instead.")
                 st.session_state["gemini_unavailable_warning_shown"] = True
             return None
 
@@ -310,15 +310,25 @@ def evaluate_research(data: dict[str, Any], earnings_result: dict[str, Any],
     market_cap = metrics.get("market_cap")
     implied_cap = float(price) * float(shares) if price is not None and shares else None
     cap_consistent = None
-    if market_cap and implied_cap:
-        cap_consistent = abs(float(market_cap) - implied_cap) / max(abs(float(market_cap)), 1) <= 0.15
+    cap_difference_pct = None
+    if market_cap is not None and implied_cap is not None and float(market_cap) > 0 and implied_cap > 0:
+        cap_difference_pct = abs(float(market_cap) - implied_cap) / abs(float(market_cap)) * 100
+        cap_consistent = cap_difference_pct <= 15
+    if market_cap is None or implied_cap is None:
+        cap_status = "Not verifiable"
+    elif float(market_cap) <= 0 or implied_cap <= 0:
+        cap_status = "Invalid data"
+    elif cap_consistent:
+        cap_status = "Passed"
+    else:
+        cap_status = "Investigate discrepancy"
     trend_method_explained = "50-day SMA" in market_result.get("analysis", "") or "200-day SMA" in market_result.get("analysis", "") or market_result.get("trend_signal") != "unavailable"
     checks = {
         "Sufficient price history": not data["history"].empty and len(data["history"]) >= 20,
         "Technical method is explicit": trend_method_explained and metrics.get("sma50") is not None,
         "Fundamental evidence coverage": available_fundamentals >= 3,
         "Usable live news evidence": news_is_live and len(usable_news) > 0,
-        "Market-cap cross-check": cap_consistent is True if cap_consistent is not None else False,
+        "Market-cap cross-check": cap_consistent is True,
         "Limitations and uncertainty disclosed": "Risk and limitations" in report_text and "do not guarantee" in report_text.lower(),
         "Missing evidence handled transparently": (news_is_live or "no usable news articles" in report_text.lower() or "news unavailable" in report_text.lower()) and ("N/A" in report_text or "not available" in report_text.lower()),
     }
@@ -330,11 +340,15 @@ def evaluate_research(data: dict[str, Any], earnings_result: dict[str, Any],
         feedback.append("Limited fundamentals are available; avoid strong conclusions and verify company filings.")
     if not checks["Usable live news evidence"]:
         feedback.append("Live news evidence is missing or sample-only; do not present illustrative items as current news.")
-    if not checks["Market-cap cross-check"]:
-        feedback.append("Market capitalisation could not be independently cross-checked against price × shares outstanding, or the values differ by more than 15%.")
+    if cap_status == "Not verifiable":
+        feedback.append("Market-cap cross-check is not verifiable because market capitalisation, price, or shares outstanding is missing; this is not proof of a mismatch.")
+    elif cap_status == "Invalid data":
+        feedback.append("Market-cap cross-check contains non-positive values; inspect the source data.")
+    elif cap_status == "Investigate discrepancy":
+        feedback.append(f"Market-cap values differ by {cap_difference_pct:.1f}%, above the 15% tolerance. Check timestamps and share-count definitions.")
     feedback.append("This score measures evidence and process coverage, not prediction accuracy or investment quality.")
     return {"score": round(100 * passed / len(checks)), "checks": checks, "passed": passed, "total": len(checks),
-            "available_fundamental_fields": available_fundamentals, "implied_market_cap": implied_cap, "market_cap_consistent": cap_consistent, "feedback": feedback}
+            "available_fundamental_fields": available_fundamentals, "implied_market_cap": implied_cap, "market_cap_consistent": cap_consistent, "market_cap_status": cap_status, "market_cap_difference_pct": cap_difference_pct, "feedback": feedback}
 
 
 def run_research(ticker: str, use_sample_articles: bool, period: str = "1y") -> dict[str, Any]:
@@ -472,7 +486,7 @@ if result:
     evaluation = report["evaluation"]
 
     st.subheader(f"Research report: {report['ticker']}")
-    st.caption(f"Period: {report.get('selected_period', '1y')} · Generated {report['generated_at']} · Sources: Yahoo Finance; Google News RSS fallback when needed · Gemini is optional")
+    st.caption(f"Period: {report.get('selected_period', '1y')} · Generated {report['generated_at']} · Sources: Yahoo Finance; Google News RSS fallback · Gemini is optional")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Latest price", f"{metrics['current_price']:,.2f}", f"{metrics['daily_change_pct']:+.2f}%")
     c2.metric(f"{report.get('selected_period', '1y')} return", f"{metrics['period_return_pct']:+.2f}%")
@@ -485,8 +499,14 @@ if result:
     st.caption("Interpretation rule: the trend signal compares the 50-day simple moving average (SMA) with the 200-day SMA. ‘Above’ is a positive long/short moving-average configuration; it does not establish future performance.")
 
     st.markdown("## 2. Market analysis")
-    chart_data = result["history"]["Close"].dropna()
-    st.line_chart(chart_data, x_label="Date", y_label="Adjusted close")
+    history = result["history"].copy().sort_index()
+    history = history[~history.index.duplicated(keep="last")]
+    close = history["Close"].dropna()
+    chart_data = pd.DataFrame(index=close.index)
+    chart_data["Closing price"] = close
+    chart_data["50-day SMA"] = close.rolling(window=50, min_periods=50).mean()
+    chart_data["200-day SMA"] = close.rolling(window=200, min_periods=200).mean()
+    st.line_chart(chart_data, x_label="Date", y_label="Price")
     tech_rows = [
         {"Indicator": "50-day SMA", "Value": metrics.get("sma50")},
         {"Indicator": "200-day SMA", "Value": metrics.get("sma200")},
@@ -508,10 +528,13 @@ if result:
         st.write(f"Reported market capitalisation: **{cap:,.0f}**")
         if implied is not None:
             st.write(f"Cross-check (latest price × shares outstanding): **{implied:,.0f}**")
-            if evaluation.get("market_cap_consistent"):
+            status = evaluation.get("market_cap_status", "Not verifiable")
+            if status == "Passed":
                 st.success("Market-cap cross-check is within 15%.")
+            elif status == "Not verifiable":
+                st.info("Market-cap cross-check is not verifiable because required data is missing; this is not proof of a mismatch.")
             else:
-                st.warning("Market-cap cross-check is unavailable or differs by more than 15%; verify source timestamps and share-count definitions.")
+                st.warning(f"Market-cap status: {status}. Verify source timestamps and share-count definitions.")
         else:
             st.info("Market-cap cross-check unavailable because shares outstanding were not provided.")
 
@@ -520,11 +543,30 @@ if result:
         st.success("Live headlines retrieved. Headlines are evidence to inspect, not proof of causal market impact.")
         titles = [a.get("article_title", "") for a in report["routed_articles"] if a.get("article_title")]
         if titles:
-            st.write(f"Retrieved **{len(titles)}** article(s). The list below is a source-level summary; the app does not claim a quantified sentiment trend unless an analysis model is configured.")
+            st.write(f"Retrieved **{len(titles)}** article(s). The list below is grouped by approximate headline themes; this is not a quantified sentiment or causal-impact analysis.")
+            from collections import defaultdict
+            def classify_news_theme(title: str) -> str:
+                text = title.lower()
+                rules = {
+                    "Products, AI and strategy": ["product", "iphone", "ai", "artificial intelligence", "strategy", "innovation"],
+                    "Analyst views and valuation": ["analyst", "price target", "valuation", "buy", "sell", "stock to buy", "defensive play"],
+                    "Institutional ownership and trading": ["stake", "shares", "ownership", "purchased", "raises stake", "investor", "trading"],
+                    "Earnings and financial performance": ["earnings", "revenue", "profit", "quarter", "financial results", "guidance"],
+                }
+                for theme, keywords in rules.items():
+                    if any(word in text for word in keywords):
+                        return theme
+                return "Other company or market news"
+            grouped_news = defaultdict(list)
             for article in report["routed_articles"]:
-                with st.expander(f"{article['specialist']} · {article['article_title']}"):
-                    st.caption(f"Category: {article['category']}")
-                    st.write(article["analysis"])
+                grouped_news[classify_news_theme(article.get("article_title", ""))].append(article)
+            for theme, theme_articles in sorted(grouped_news.items()):
+                with st.expander(f"{theme} · {len(theme_articles)} headline(s)", expanded=True):
+                    for article in theme_articles:
+                        st.markdown(f"**{article['article_title']}**")
+                        st.caption(f"{article.get('specialist', 'Specialist')} · Category: {article.get('category', 'news')}")
+                        st.write(article["analysis"])
+            st.caption("Themes are assigned using deterministic keyword rules. They are approximate and do not establish sentiment or prove that news caused price movements.")
     else:
         st.warning("No live headlines were retrieved. Any sample articles are illustrative only and must not be treated as current news.")
         for article in report["routed_articles"]:
