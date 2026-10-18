@@ -354,7 +354,7 @@ with st.sidebar:
         value=True,
     )
     st.caption("Live news is only reported when the Yahoo Finance provider returns articles.")
-    run_button = st.button("Run research", type="primary", use_container_width=True)
+    run_button = st.button("Run research", type="primary", width="stretch")
     st.divider()
     st.markdown("**Data sources**")
     st.markdown("- Yahoo Finance (prices/fundamentals/news)\n- Google Gemini (optional narrative analysis)")
@@ -407,7 +407,7 @@ if result:
 
     with tab_market:
         st.markdown("### Price history")
-        st.line_chart(result["history"]["Close"], use_container_width=True)
+        st.line_chart(result["history"]["Close"], width="stretch")
         st.markdown("### Technical indicators")
         technical = {
             "50-day SMA": metrics["sma50"],
@@ -419,7 +419,7 @@ if result:
         }
         st.dataframe(pd.DataFrame(
             [{"Indicator": k, "Value": v} for k, v in technical.items()]
-        ), use_container_width=True, hide_index=True)
+        ), width="stretch", hide_index=True)
         st.markdown("### Market specialist")
         st.write(report["market_analysis"]["analysis"])
 
@@ -429,7 +429,7 @@ if result:
             {"Metric": k.replace("_", " ").title(), "Value": v}
             for k, v in report["fundamental_analysis"]["metrics"].items()
         ]
-        st.dataframe(pd.DataFrame(fundamental_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(fundamental_rows), width="stretch", hide_index=True)
         st.write(report["fundamental_analysis"]["analysis"])
 
     with tab_news:
@@ -459,7 +459,7 @@ if result:
         st.markdown("### Local research memory")
         memory = load_memory()
         if memory:
-            st.dataframe(pd.DataFrame(memory[::-1]), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(memory[::-1]), width="stretch", hide_index=True)
         else:
             st.caption("No saved research runs yet.")
 else:
