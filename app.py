@@ -135,12 +135,9 @@ class BaseAgent:
         self.name = name
 
     def _gemini(self, prompt: str) -> str | None:
-        """Call Gemini only while available; stop retrying after quota errors in this session."""
-        # A 429 quota error applies to the project/model, not just this specialist.
-        # Remember it for this Streamlit session to prevent repeated failing calls.
-        if st.session_state.get("gemini_quota_exhausted", False):
+        """Return a Gemini response when configured; otherwise return None."""
+        if st.session_state.get("gemini_disabled_for_session", False):
             return None
-
         api_key = st.secrets.get("GOOGLE_API_KEY", os.getenv("GOOGLE_API_KEY", ""))
         if not api_key or ChatGoogleGenerativeAI is None:
             return None
@@ -153,28 +150,17 @@ class BaseAgent:
             response = llm.invoke([HumanMessage(content=prompt)])
             return str(response.content)
         except Exception as exc:
-            error_text = str(exc)
-            is_quota_error = (
-                "429" in error_text
-                or "RESOURCE_EXHAUSTED" in error_text.upper()
-                or "quota exceeded" in error_text.lower()
-            )
-            if is_quota_error:
-                st.session_state["gemini_quota_exhausted"] = True
-                if not st.session_state.get("gemini_quota_warning_shown", False):
-                    st.warning(
-                        "Gemini API quota is exhausted. The app will use built-in "
-                        "fallback analysis for the rest of this session and will not "
-                        "keep retrying Gemini. Check Google AI Studio quotas or try "
-                        "again after the reset."
-                    )
-                    st.session_state["gemini_quota_warning_shown"] = True
-            elif not st.session_state.get("gemini_unavailable_warning_shown", False):
-                st.warning(
-                    "Gemini is unavailable; the app will continue with fallback analysis. "
-                    "Check the model name and API key if this persists."
-                )
-                st.session_state["gemini_unavailable_warning_shown"] = True
+            # Quota errors are session-latched so every article does not repeat
+            # the same long 429 traceback or trigger more Gemini calls.
+            message = str(exc)
+            quota_error = "429" in message or "RESOURCE_EXHAUSTED" in message or "quota" in message.lower()
+            st.session_state["gemini_disabled_for_session"] = True
+            if not st.session_state.get("gemini_warning_shown", False):
+                if quota_error:
+                    st.warning("Gemini quota is exhausted for this session. Continuing with the built-in fallback; market, fundamentals, and news retrieval remain available.")
+                else:
+                    st.warning("Gemini is unavailable. Continuing with the built-in fallback summary.")
+                st.session_state["gemini_warning_shown"] = True
             return None
 
 
@@ -343,7 +329,11 @@ def evaluate_research(data: dict[str, Any], earnings_result: dict[str, Any],
     if not checks["Usable live news evidence"]:
         feedback.append("Live news evidence is missing or sample-only; do not present illustrative items as current news.")
     if not checks["Market-cap cross-check"]:
-        feedback.append("Market capitalisation could not be independently cross-checked against price × shares outstanding, or the values differ by more than 15%.")
+        if implied_cap is None or market_cap is None:
+            feedback.append("Market-cap cross-check is unavailable because market capitalisation, current price, or shares outstanding is missing. This is a data-availability issue, not proof that the reported value is wrong.")
+        else:
+            difference_pct = abs(float(market_cap) - implied_cap) / max(abs(float(market_cap)), 1) * 100
+            feedback.append(f"Market-cap cross-check differs by {difference_pct:.1f}% (tolerance: 15%). Verify timestamps, share classes, and share-count definitions before concluding the value is wrong.")
     feedback.append("This score measures evidence and process coverage, not prediction accuracy or investment quality.")
     return {"score": round(100 * passed / len(checks)), "checks": checks, "passed": passed, "total": len(checks),
             "available_fundamental_fields": available_fundamentals, "implied_market_cap": implied_cap, "market_cap_consistent": cap_consistent, "feedback": feedback}
@@ -421,6 +411,7 @@ def run_research(ticker: str, use_sample_articles: bool, period: str = "1y") -> 
         "market_analysis": market_result,
         "fundamental_analysis": earnings_result,
         "routed_articles": routed_articles,
+        "raw_articles": articles,
         "live_news_available": news_is_live,
         "evaluation": evaluation,
         "report_text": report_text,
@@ -437,6 +428,30 @@ def run_research(ticker: str, use_sample_articles: bool, period: str = "1y") -> 
         "live_news_available": news_is_live,
     })
     return {"report": final_report, "history": data["history"], "info": data["info"]}
+
+
+def synthesize_news(articles: list[dict[str, Any]]) -> dict[str, Any]:
+    """Group live headlines into transparent keyword themes without an LLM."""
+    live = [a for a in articles if a.get("title") and not str(a.get("source", "")).startswith("Illustrative sample")]
+    rules = {
+        "Earnings and financial performance": ("earnings", "revenue", "profit", "quarter", "sales", "margin", "guidance", "results"),
+        "Products, AI and strategy": ("product", "iphone", "ai", "artificial intelligence", "launch", "strategy", "innovation"),
+        "Analyst views and valuation": ("analyst", "price target", "valuation", "buy", "sell", "stock to buy", "defensive play"),
+        "Institutional ownership and trading": ("stake", "shares", "purchased", "investor", "fund", "ownership", "market cap", "market value"),
+        "Other company or market news": (),
+    }
+    groups = {k: [] for k in rules}
+    for article in live:
+        title = str(article.get("title", ""))
+        low = title.lower()
+        chosen = "Other company or market news"
+        for theme, keywords in rules.items():
+            if theme != "Other company or market news" and any(word in low for word in keywords):
+                chosen = theme
+                break
+        groups[chosen].append(title)
+    return {"article_count": len(live), "groups": {k: v for k, v in groups.items() if v},
+            "method": "Deterministic keyword grouping of headlines; not an LLM sentiment or causal-impact analysis."}
 
 
 # ---------- Streamlit UI ----------
@@ -532,7 +547,15 @@ if result:
         st.success("Live headlines retrieved. Headlines are evidence to inspect, not proof of causal market impact.")
         titles = [a.get("article_title", "") for a in report["routed_articles"] if a.get("article_title")]
         if titles:
+            synthesis = synthesize_news(result["report"].get("raw_articles", []))
             st.write(f"Retrieved **{len(titles)}** article(s). The list below is a source-level summary; the app does not claim a quantified sentiment trend unless an analysis model is configured.")
+            st.markdown("### Rule-based headline themes")
+            if synthesis["groups"]:
+                for theme, theme_titles in synthesis["groups"].items():
+                    with st.expander(f"{theme} · {len(theme_titles)} headline(s)"):
+                        for headline in theme_titles:
+                            st.write(f"- {headline}")
+            st.caption(synthesis["method"] + " Theme labels are approximate and can overlap conceptually.")
             for article in report["routed_articles"]:
                 with st.expander(f"{article['specialist']} · {article['article_title']}"):
                     st.caption(f"Category: {article['category']}")

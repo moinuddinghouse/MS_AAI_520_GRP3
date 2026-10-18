@@ -32,3 +32,10 @@ Push `app.py`, `requirements.txt`, and `README.md` to a GitHub repository, then 
 ## Limitations
 
 Market data/news availability depends on external providers and may be delayed or incomplete. Historical performance is not predictive. The evidence-coverage score measures process checks, not prediction accuracy or investment quality. This is an educational application, not personalized investment advice.
+
+## Recent reliability improvements
+
+- Gemini quota/API errors are shown as one concise warning per Streamlit session; after an error, further Gemini calls are skipped for that session and deterministic fallback analysis is used.
+- News headlines are grouped into approximate themes using transparent keyword rules. This is not sentiment analysis and does not establish that a headline caused a price movement.
+- Market-cap validation distinguishes missing inputs from an actual discrepancy. When all inputs exist, it compares reported market capitalisation with latest price multiplied by shares outstanding, using a 15% tolerance. Differences can reflect timestamps, share classes, or provider definitions and should be investigated rather than assumed to be errors.
+- The evaluator score is evidence/process coverage, not investment accuracy or return prediction.
