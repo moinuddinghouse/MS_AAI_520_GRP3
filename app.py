@@ -44,11 +44,6 @@ def fetch_market_data(ticker: str, period: str = "1y") -> dict[str, Any]:
     """Fetch price history for the selected lookback period and company fundamentals."""
     stock = yf.Ticker(ticker)
     history = stock.history(period=period, auto_adjust=True)
-    if history is not None and not history.empty:
-        # Normalize the time axis so chart dates remain chronological and bounded
-        # by the selected lookback period.
-        history = history[~history.index.duplicated(keep="last")].sort_index()
-        history = history.loc[history["Close"].notna()]
     if history is None or history.empty:
         raise ValueError(
             f"No price history was returned for {ticker}. Check the symbol "
@@ -80,7 +75,6 @@ def fetch_market_data(ticker: str, period: str = "1y") -> dict[str, Any]:
             (current_price / prior_price - 1) * 100 if prior_price else 0.0
         ),
         "market_cap": info.get("marketCap"),
-        "shares_outstanding": info.get("sharesOutstanding"),
         "pe_ratio": info.get("trailingPE"),
         "revenue": info.get("totalRevenue"),
         "net_income": info.get("netIncomeToCommon"),
@@ -141,7 +135,9 @@ class BaseAgent:
         self.name = name
 
     def _gemini(self, prompt: str) -> str | None:
-        """Return a Gemini response when configured; otherwise return None."""
+        """Call Gemini if available; suppress repeated quota failures for this session."""
+        if st.session_state.get("gemini_quota_exhausted", False):
+            return None
         api_key = st.secrets.get("GOOGLE_API_KEY", os.getenv("GOOGLE_API_KEY", ""))
         if not api_key or ChatGoogleGenerativeAI is None:
             return None
@@ -150,11 +146,23 @@ class BaseAgent:
                 model="gemini-3.8-flash",
                 google_api_key=api_key,
                 temperature=0.2,
+                max_retries=0,
             )
             response = llm.invoke([HumanMessage(content=prompt)])
             return str(response.content)
         except Exception as exc:
-            st.warning(f"{self.name}: Gemini was unavailable; using fallback summary. ({exc})")
+            message = str(exc).lower()
+            is_quota_error = any(token in message for token in (
+                "resource_exhausted", "429", "quota exceeded", "rate limit"
+            ))
+            if is_quota_error:
+                st.session_state["gemini_quota_exhausted"] = True
+                if not st.session_state.get("gemini_quota_warning_shown", False):
+                    st.warning("Gemini quota is exhausted. Using built-in summaries for the rest of this session.")
+                    st.session_state["gemini_quota_warning_shown"] = True
+            elif not st.session_state.get("gemini_unavailable_warning_shown", False):
+                st.info("Gemini is temporarily unavailable. Using built-in summaries instead.")
+                st.session_state["gemini_unavailable_warning_shown"] = True
             return None
 
 
@@ -297,7 +305,7 @@ def evaluate_research(data: dict[str, Any], earnings_result: dict[str, Any],
     fundamentals = earnings_result["metrics"]
     available_fundamentals = sum(v is not None for v in fundamentals.values())
     usable_news = [a for a in articles if a.get("title") and a.get("source") != "Illustrative sample — not live news"]
-    shares = metrics.get("shares_outstanding") or info.get("sharesOutstanding")
+    shares = info.get("sharesOutstanding")
     price = metrics.get("current_price")
     market_cap = metrics.get("market_cap")
     implied_cap = float(price) * float(shares) if price is not None and shares else None
@@ -464,7 +472,7 @@ if result:
     evaluation = report["evaluation"]
 
     st.subheader(f"Research report: {report['ticker']}")
-    st.caption(f"Period: {report.get('selected_period', '1y')} · Generated {report['generated_at']} · Sources: Yahoo Finance; Google News RSS fallback · Gemini is optional")
+    st.caption(f"Period: {report.get('selected_period', '1y')} · Generated {report['generated_at']} · Sources: Yahoo Finance; Google News RSS fallback when needed · Gemini is optional")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Latest price", f"{metrics['current_price']:,.2f}", f"{metrics['daily_change_pct']:+.2f}%")
     c2.metric(f"{report.get('selected_period', '1y')} return", f"{metrics['period_return_pct']:+.2f}%")
@@ -477,18 +485,8 @@ if result:
     st.caption("Interpretation rule: the trend signal compares the 50-day simple moving average (SMA) with the 200-day SMA. ‘Above’ is a positive long/short moving-average configuration; it does not establish future performance.")
 
     st.markdown("## 2. Market analysis")
-    chart_history = result["history"].copy()
-    chart_history = chart_history.loc[chart_history["Close"].notna()].sort_index()
-    # Keep chart index and all series aligned to the same chronological dates.
-    chart_data = pd.DataFrame(index=pd.to_datetime(chart_history.index))
-    chart_data["Adjusted close"] = pd.to_numeric(chart_history["Close"], errors="coerce")
-    chart_data["50-day SMA"] = chart_data["Adjusted close"].rolling(50, min_periods=50).mean()
-    chart_data["200-day SMA"] = chart_data["Adjusted close"].rolling(200, min_periods=200).mean()
-    chart_data = chart_data.replace([np.inf, -np.inf], np.nan).dropna(subset=["Adjusted close"])
-    # A one-year selection should not display dates beyond its actual retrieved data.
-    if not chart_data.empty:
-        chart_data = chart_data.loc[chart_data.index <= chart_data.index.max()]
-    st.line_chart(chart_data, x_label="Date", y_label="Price", height=380)
+    chart_data = result["history"]["Close"].dropna()
+    st.line_chart(chart_data, x_label="Date", y_label="Adjusted close")
     tech_rows = [
         {"Indicator": "50-day SMA", "Value": metrics.get("sma50")},
         {"Indicator": "200-day SMA", "Value": metrics.get("sma200")},
@@ -523,28 +521,6 @@ if result:
         titles = [a.get("article_title", "") for a in report["routed_articles"] if a.get("article_title")]
         if titles:
             st.write(f"Retrieved **{len(titles)}** article(s). The list below is a source-level summary; the app does not claim a quantified sentiment trend unless an analysis model is configured.")
-            def headline_theme(title: str) -> str:
-                text = title.lower()
-                rules = [
-                    ("Products, AI and strategy", ("iphone", "product", "ai", "artificial intelligence", "chip", "strategy", "launch")),
-                    ("Analyst views and valuation", ("analyst", "price target", "valuation", "buy right now", "defensive play", "worth in", "stock to buy")),
-                    ("Institutional ownership and trading", ("stake", "purchased by", "raises stake", "institutional", "shares", "trading lower", "market cap", "market value")),
-                    ("Earnings and financial performance", ("earnings", "revenue", "profit", "quarter", "results", "guidance")),
-                ]
-                for label, keywords in rules:
-                    if any(keyword in text for keyword in keywords):
-                        return label
-                return "Other company or market news"
-            theme_groups: dict[str, list[str]] = {}
-            for title in titles:
-                theme_groups.setdefault(headline_theme(title), []).append(title)
-            st.markdown("### Rule-based headline themes")
-            for theme, theme_titles in sorted(theme_groups.items(), key=lambda item: (-len(item[1]), item[0])):
-                st.write(f"**{theme}** · {len(theme_titles)} headline(s)")
-                with st.expander(f"View {theme.lower()} headlines"):
-                    for title in theme_titles:
-                        st.write(f"- {title}")
-            st.caption("Keyword-based headline grouping only. Categories are approximate and do not measure sentiment or prove causal market impact.")
             for article in report["routed_articles"]:
                 with st.expander(f"{article['specialist']} · {article['article_title']}"):
                     st.caption(f"Category: {article['category']}")
