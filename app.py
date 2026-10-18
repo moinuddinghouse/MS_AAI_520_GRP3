@@ -241,24 +241,112 @@ class EarningsSpecialistAgent:
 
 
 class NewsSpecialistAgent:
+    """Retrieve real news from Yahoo Finance, falling back to FMP when configured."""
+
+    def __init__(self):
+        self.data_source = "Yahoo Finance"
+        self.retrieval_error = None
+
+    @staticmethod
+    def _fmp_api_key() -> str | None:
+        key = os.getenv("FMP_API_KEY", "").strip()
+        try:
+            key = (st.secrets.get("FMP_API_KEY", "") or key).strip()
+        except Exception:
+            pass
+        return key or None
+
+    def _get_fmp_news(self, ticker: str) -> tuple[list[dict], str | None]:
+        api_key = self._fmp_api_key()
+        if not api_key:
+            return [], (
+                "Yahoo Finance returned no news. To enable news fallback, add FMP_API_KEY "
+                "to Streamlit Secrets. Keep the key out of app.py and GitHub."
+            )
+
+        # Official FMP Search Stock News endpoint: /stable/news/stock?symbols=AAPL
+        try:
+            response = requests.get(
+                "https://financialmodelingprep.com/stable/news/stock",
+                params={"symbols": ticker, "page": 0, "limit": 20, "apikey": api_key},
+                timeout=12,
+            )
+            if response.status_code != 200:
+                return [], f"FMP stock-news endpoint returned HTTP {response.status_code}. Check API key and plan access."
+            payload = response.json()
+            if isinstance(payload, dict):
+                if payload.get("Error Message") or payload.get("Error") or payload.get("error"):
+                    return [], "FMP stock-news endpoint returned an API error. Check API key and plan access."
+                return [], "FMP stock-news endpoint returned an unexpected response format."
+            if not isinstance(payload, list):
+                return [], "FMP stock-news endpoint returned an unexpected response format."
+
+            rows = []
+            ticker_upper = ticker.upper()
+            for item in payload:
+                if not isinstance(item, dict):
+                    continue
+                # The endpoint is symbol-filtered, but verify symbols when present.
+                item_symbol = str(item.get("symbol") or "").upper()
+                if item_symbol and item_symbol != ticker_upper:
+                    continue
+                title = item.get("title") or ""
+                summary = item.get("text") or item.get("summary") or ""
+                if not title and not summary:
+                    continue
+                rows.append({
+                    "title": title,
+                    "publisher": item.get("publisher") or item.get("site") or "",
+                    "summary": summary,
+                    "link": item.get("url") or "",
+                    "published": item.get("publishedDate") or "",
+                })
+            if rows:
+                self.data_source = "Financial Modeling Prep"
+                return rows[:20], None
+            return [], "FMP returned no matching news articles for this ticker."
+        except requests.RequestException as exc:
+            return [], f"FMP stock-news request failed: {type(exc).__name__}."
+        except (ValueError, TypeError):
+            return [], "FMP stock-news endpoint returned unreadable data."
+
     def ingest(self, ticker: str) -> pd.DataFrame:
+        rows = []
+        yahoo_error = None
         try:
             raw_items = yf.Ticker(ticker).news or []
-        except Exception:
+        except Exception as exc:
             raw_items = []
+            yahoo_error = f"Yahoo Finance news request failed: {type(exc).__name__}."
 
-        rows = []
         for item in raw_items[:20]:
-            content = item.get("content", item) if isinstance(item, dict) else {}
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content", item)
+            if not isinstance(content, dict):
+                continue
             provider = content.get("provider", {}) or {}
             canonical = content.get("canonicalUrl", {}) or {}
             rows.append({
                 "title": content.get("title") or item.get("title") or "",
                 "publisher": provider.get("displayName", "") if isinstance(provider, dict) else item.get("publisher", ""),
-                "summary": content.get("summary") or item.get("summary") or "",
+                "summary": content.get("summary") or item.get("summary") or item.get("text") or "",
                 "link": canonical.get("url", "") if isinstance(canonical, dict) else item.get("link", ""),
                 "published": content.get("pubDate") or item.get("providerPublishTime", ""),
             })
+
+        # If Yahoo returns nothing, try the separately configured FMP news API.
+        if not rows:
+            rows, fmp_error = self._get_fmp_news(ticker)
+            if not rows:
+                self.data_source = "Unavailable"
+                self.retrieval_error = " ".join(part for part in [yahoo_error or "Yahoo Finance returned no news articles.", fmp_error] if part)
+            else:
+                self.retrieval_error = None
+        else:
+            self.data_source = "Yahoo Finance"
+            self.retrieval_error = None
+
         return pd.DataFrame(rows, columns=["title", "publisher", "summary", "link", "published"])
 
     def preprocess(self, news_df: pd.DataFrame) -> pd.DataFrame:
@@ -460,6 +548,8 @@ MEMORY
         "financials": financials,
         "news": articles,
         "news_summary": news_summary,
+        "news_source": news_agent.data_source,
+        "news_retrieval_error": news_agent.retrieval_error,
         "integrated_analysis": integrated,
     }
     first_eval = evaluator.evaluate(result)
@@ -494,7 +584,7 @@ with st.sidebar:
     run_button = st.button("Run investment research", type="primary", use_container_width=True)
     st.divider()
     st.caption("Market/news data is retrieved at run time and may be missing or delayed.")
-    st.caption("For the fundamentals fallback, configure FMP_API_KEY in Streamlit Secrets.")
+    st.caption("For company fundamentals and news fallback, configure FMP_API_KEY in Streamlit Secrets.")
 
 if run_button:
     if not ticker or not ticker.replace(".", "").isalnum():
@@ -587,9 +677,13 @@ if result:
         st.dataframe(pd.DataFrame(display_metrics.items(), columns=["Metric", "Value"]), hide_index=True, use_container_width=True)
 
     st.subheader("News pipeline and routing")
+    st.caption(f"News source: {result.get('news_source', 'Unknown')}")
     articles = result["news"]
     if articles.empty:
-        st.info("No recent news was returned by the selected source in this run. The dashboard does not create substitute news evidence.")
+        st.info("No recent news was returned by the configured sources in this run. The dashboard does not create substitute news evidence.")
+        if result.get("news_retrieval_error"):
+            with st.expander("News-data diagnostic details"):
+                st.write(result["news_retrieval_error"])
     else:
         cols = [c for c in ["title", "publisher", "category", "topics", "routed_to", "link"] if c in articles.columns]
         st.dataframe(articles[cols], hide_index=True, use_container_width=True)
