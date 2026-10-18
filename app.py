@@ -40,10 +40,10 @@ MEMORY_PATH = APP_DIR / "research_memory.json"
 
 
 # ---------- Data retrieval ----------
-def fetch_market_data(ticker: str) -> dict[str, Any]:
-    """Fetch recent price history and available company fundamentals."""
+def fetch_market_data(ticker: str, period: str = "1y") -> dict[str, Any]:
+    """Fetch price history for the selected lookback period and company fundamentals."""
     stock = yf.Ticker(ticker)
-    history = stock.history(period="1y", auto_adjust=True)
+    history = stock.history(period=period, auto_adjust=True)
     if history is None or history.empty:
         raise ValueError(
             f"No price history was returned for {ticker}. Check the symbol "
@@ -323,9 +323,9 @@ def evaluate_research(data: dict[str, Any], earnings_result: dict[str, Any],
             "available_fundamental_fields": available_fundamentals, "implied_market_cap": implied_cap, "market_cap_consistent": cap_consistent, "feedback": feedback}
 
 
-def run_research(ticker: str, use_sample_articles: bool) -> dict[str, Any]:
+def run_research(ticker: str, use_sample_articles: bool, period: str = "1y") -> dict[str, Any]:
     ticker = ticker.strip().upper()
-    data = fetch_market_data(ticker)
+    data = fetch_market_data(ticker, period=period)
 
     news_agent = NewsSpecialistAgent("News Specialist")
     earnings_article_agent = NewsSpecialistAgent("Earnings Specialist")
@@ -389,6 +389,7 @@ def run_research(ticker: str, use_sample_articles: bool) -> dict[str, Any]:
     evaluation = evaluate_research(data, earnings_result, articles, news_is_live, market_result, report_text)
     final_report = {
         "ticker": ticker,
+        "selected_period": period,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "metrics": data["metrics"],
         "market_analysis": market_result,
@@ -424,6 +425,9 @@ st.info(
 with st.sidebar:
     st.header("Research settings")
     ticker_input = st.text_input("Stock symbol", value="AAPL", max_chars=12).strip().upper()
+    period_options = {"1 year": "1y", "2 years": "2y", "5 years": "5y", "10 years": "10y", "Maximum available": "max"}
+    selected_period_label = st.selectbox("Historical period", list(period_options.keys()), index=0, help="Choose how much historical price data to analyze and display.")
+    selected_period = period_options[selected_period_label]
     use_sample_articles = st.checkbox(
         "Use clearly labelled sample articles if live news is unavailable",
         value=True,
@@ -441,7 +445,7 @@ if run_button:
         with st.spinner(f"Researching {ticker_input}..."):
             try:
                 st.session_state["research_result"] = run_research(
-                    ticker_input, use_sample_articles
+                    ticker_input, use_sample_articles, selected_period
                 )
             except Exception as exc:
                 st.error(f"Research failed: {exc}")
@@ -454,16 +458,16 @@ if result:
     evaluation = report["evaluation"]
 
     st.subheader(f"Research report: {report['ticker']}")
-    st.caption(f"Generated {report['generated_at']} · Sources: Yahoo Finance; Google News RSS fallback · Gemini is optional")
+    st.caption(f"Period: {report.get('selected_period', '1y')} · Generated {report['generated_at']} · Sources: Yahoo Finance; Google News RSS fallback · Gemini is optional")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Latest price", f"{metrics['current_price']:,.2f}", f"{metrics['daily_change_pct']:+.2f}%")
-    c2.metric("1-year return", f"{metrics['period_return_pct']:+.2f}%")
+    c2.metric(f"{report.get('selected_period', '1y')} return", f"{metrics['period_return_pct']:+.2f}%")
     c3.metric("Annualized volatility", f"{metrics['annualized_volatility_pct']:.2f}%" if metrics['annualized_volatility_pct'] is not None else "N/A")
     c4.metric("Evidence coverage", f"{evaluation['score']}/100", f"{evaluation['passed']}/{evaluation['total']} checks")
 
     st.markdown("## 1. Executive summary")
     trend = report["market_analysis"].get("trend_signal", "unavailable")
-    st.write(f"For **{report['ticker']}**, the latest available adjusted close is **{metrics['current_price']:,.2f}** and the one-year price return is **{metrics['period_return_pct']:+.2f}%**. The technical specialist reports the 50-day SMA as **{trend}** the 200-day SMA where both are available. This is a historical indicator, not a forecast or recommendation.")
+    st.write(f"For **{report['ticker']}**, the latest available adjusted close is **{metrics['current_price']:,.2f}** and the selected-period ({report.get('selected_period', '1y')}) price return is **{metrics['period_return_pct']:+.2f}%**. The technical specialist reports the 50-day SMA as **{trend}** the 200-day SMA where both are available. This is a historical indicator, not a forecast or recommendation.")
     st.caption("Interpretation rule: the trend signal compares the 50-day simple moving average (SMA) with the 200-day SMA. ‘Above’ is a positive long/short moving-average configuration; it does not establish future performance.")
 
     st.markdown("## 2. Market analysis")

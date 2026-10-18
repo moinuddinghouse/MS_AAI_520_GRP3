@@ -1,28 +1,34 @@
 # Multi-Agent Investment Research System
 
-A Streamlit companion app for an educational multi-agent financial research workflow. It presents market indicators, available fundamentals, retrieved news, an evidence-coverage evaluator, and research history in one scrollable report.
+A Streamlit educational demo for market data, technical indicators, company fundamentals, news evidence, and evaluator checks.
 
 ## Run locally
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
+source .venv/bin/activate  # Windows: .venv\\Scripts\\activate
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
+## Select a historical period
+
+Use **Historical period** in the sidebar to choose 1 year, 2 years, 5 years, 10 years, or maximum available price history. The selected period applies to the market chart and period-return calculation. Indicators such as the 50-day and 200-day moving averages still use their named trading-day windows.
+
 ## Optional Gemini review
 
-Add `GOOGLE_API_KEY` to Streamlit secrets or the environment. Without a key, the app uses deterministic fallback summaries. Never commit API keys.
+Set `GOOGLE_API_KEY` as an environment variable or in Streamlit Community Cloud under **App settings → Secrets**:
 
-## Streamlit Community Cloud
+```toml
+GOOGLE_API_KEY = "your-api-key"
+```
 
-Push `app.py`, `requirements.txt`, and this README to the repository root (or select the correct app path in deployment settings). Set `GOOGLE_API_KEY` in **App settings → Secrets** if desired.
+The app uses deterministic fallback text when Gemini is not configured. Do not commit secrets to GitHub.
 
-## Evaluation score
+## Deploy to Streamlit Community Cloud
 
-The score measures evidence/process coverage only. It is not prediction accuracy or a buy/sell signal. Market-cap validation compares reported market cap with latest price × shares outstanding when both values are available.
+Push `app.py`, `requirements.txt`, and `README.md` to a GitHub repository, then create an app in Streamlit Community Cloud and select `app.py` as the entry point.
 
 ## Limitations
 
-Yahoo Finance and Google News RSS availability/rate limits can vary. Local JSON memory may not persist across cloud restarts. The app does not currently include peer-group valuation percentiles or a validated predictive backtest. Educational use only; not personalized financial advice.
+Market data/news availability depends on external providers and may be delayed or incomplete. Historical performance is not predictive. The evidence-coverage score measures process checks, not prediction accuracy or investment quality. This is an educational application, not personalized investment advice.
