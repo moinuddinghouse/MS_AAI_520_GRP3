@@ -44,6 +44,11 @@ def fetch_market_data(ticker: str, period: str = "1y") -> dict[str, Any]:
     """Fetch price history for the selected lookback period and company fundamentals."""
     stock = yf.Ticker(ticker)
     history = stock.history(period=period, auto_adjust=True)
+    if history is not None and not history.empty:
+        # Normalize the time axis so chart dates remain chronological and bounded
+        # by the selected lookback period.
+        history = history[~history.index.duplicated(keep="last")].sort_index()
+        history = history.loc[history["Close"].notna()]
     if history is None or history.empty:
         raise ValueError(
             f"No price history was returned for {ticker}. Check the symbol "
@@ -75,6 +80,7 @@ def fetch_market_data(ticker: str, period: str = "1y") -> dict[str, Any]:
             (current_price / prior_price - 1) * 100 if prior_price else 0.0
         ),
         "market_cap": info.get("marketCap"),
+        "shares_outstanding": info.get("sharesOutstanding"),
         "pe_ratio": info.get("trailingPE"),
         "revenue": info.get("totalRevenue"),
         "net_income": info.get("netIncomeToCommon"),
@@ -136,8 +142,6 @@ class BaseAgent:
 
     def _gemini(self, prompt: str) -> str | None:
         """Return a Gemini response when configured; otherwise return None."""
-        if st.session_state.get("gemini_disabled_for_session", False):
-            return None
         api_key = st.secrets.get("GOOGLE_API_KEY", os.getenv("GOOGLE_API_KEY", ""))
         if not api_key or ChatGoogleGenerativeAI is None:
             return None
@@ -150,17 +154,7 @@ class BaseAgent:
             response = llm.invoke([HumanMessage(content=prompt)])
             return str(response.content)
         except Exception as exc:
-            # Quota errors are session-latched so every article does not repeat
-            # the same long 429 traceback or trigger more Gemini calls.
-            message = str(exc)
-            quota_error = "429" in message or "RESOURCE_EXHAUSTED" in message or "quota" in message.lower()
-            st.session_state["gemini_disabled_for_session"] = True
-            if not st.session_state.get("gemini_warning_shown", False):
-                if quota_error:
-                    st.warning("Gemini quota is exhausted for this session. Continuing with the built-in fallback; market, fundamentals, and news retrieval remain available.")
-                else:
-                    st.warning("Gemini is unavailable. Continuing with the built-in fallback summary.")
-                st.session_state["gemini_warning_shown"] = True
+            st.warning(f"{self.name}: Gemini was unavailable; using fallback summary. ({exc})")
             return None
 
 
@@ -303,7 +297,7 @@ def evaluate_research(data: dict[str, Any], earnings_result: dict[str, Any],
     fundamentals = earnings_result["metrics"]
     available_fundamentals = sum(v is not None for v in fundamentals.values())
     usable_news = [a for a in articles if a.get("title") and a.get("source") != "Illustrative sample — not live news"]
-    shares = info.get("sharesOutstanding")
+    shares = metrics.get("shares_outstanding") or info.get("sharesOutstanding")
     price = metrics.get("current_price")
     market_cap = metrics.get("market_cap")
     implied_cap = float(price) * float(shares) if price is not None and shares else None
@@ -329,11 +323,7 @@ def evaluate_research(data: dict[str, Any], earnings_result: dict[str, Any],
     if not checks["Usable live news evidence"]:
         feedback.append("Live news evidence is missing or sample-only; do not present illustrative items as current news.")
     if not checks["Market-cap cross-check"]:
-        if implied_cap is None or market_cap is None:
-            feedback.append("Market-cap cross-check is unavailable because market capitalisation, current price, or shares outstanding is missing. This is a data-availability issue, not proof that the reported value is wrong.")
-        else:
-            difference_pct = abs(float(market_cap) - implied_cap) / max(abs(float(market_cap)), 1) * 100
-            feedback.append(f"Market-cap cross-check differs by {difference_pct:.1f}% (tolerance: 15%). Verify timestamps, share classes, and share-count definitions before concluding the value is wrong.")
+        feedback.append("Market capitalisation could not be independently cross-checked against price × shares outstanding, or the values differ by more than 15%.")
     feedback.append("This score measures evidence and process coverage, not prediction accuracy or investment quality.")
     return {"score": round(100 * passed / len(checks)), "checks": checks, "passed": passed, "total": len(checks),
             "available_fundamental_fields": available_fundamentals, "implied_market_cap": implied_cap, "market_cap_consistent": cap_consistent, "feedback": feedback}
@@ -411,7 +401,6 @@ def run_research(ticker: str, use_sample_articles: bool, period: str = "1y") -> 
         "market_analysis": market_result,
         "fundamental_analysis": earnings_result,
         "routed_articles": routed_articles,
-        "raw_articles": articles,
         "live_news_available": news_is_live,
         "evaluation": evaluation,
         "report_text": report_text,
@@ -428,30 +417,6 @@ def run_research(ticker: str, use_sample_articles: bool, period: str = "1y") -> 
         "live_news_available": news_is_live,
     })
     return {"report": final_report, "history": data["history"], "info": data["info"]}
-
-
-def synthesize_news(articles: list[dict[str, Any]]) -> dict[str, Any]:
-    """Group live headlines into transparent keyword themes without an LLM."""
-    live = [a for a in articles if a.get("title") and not str(a.get("source", "")).startswith("Illustrative sample")]
-    rules = {
-        "Earnings and financial performance": ("earnings", "revenue", "profit", "quarter", "sales", "margin", "guidance", "results"),
-        "Products, AI and strategy": ("product", "iphone", "ai", "artificial intelligence", "launch", "strategy", "innovation"),
-        "Analyst views and valuation": ("analyst", "price target", "valuation", "buy", "sell", "stock to buy", "defensive play"),
-        "Institutional ownership and trading": ("stake", "shares", "purchased", "investor", "fund", "ownership", "market cap", "market value"),
-        "Other company or market news": (),
-    }
-    groups = {k: [] for k in rules}
-    for article in live:
-        title = str(article.get("title", ""))
-        low = title.lower()
-        chosen = "Other company or market news"
-        for theme, keywords in rules.items():
-            if theme != "Other company or market news" and any(word in low for word in keywords):
-                chosen = theme
-                break
-        groups[chosen].append(title)
-    return {"article_count": len(live), "groups": {k: v for k, v in groups.items() if v},
-            "method": "Deterministic keyword grouping of headlines; not an LLM sentiment or causal-impact analysis."}
 
 
 # ---------- Streamlit UI ----------
@@ -512,8 +477,18 @@ if result:
     st.caption("Interpretation rule: the trend signal compares the 50-day simple moving average (SMA) with the 200-day SMA. ‘Above’ is a positive long/short moving-average configuration; it does not establish future performance.")
 
     st.markdown("## 2. Market analysis")
-    chart_data = result["history"]["Close"].dropna()
-    st.line_chart(chart_data, x_label="Date", y_label="Adjusted close")
+    chart_history = result["history"].copy()
+    chart_history = chart_history.loc[chart_history["Close"].notna()].sort_index()
+    # Keep chart index and all series aligned to the same chronological dates.
+    chart_data = pd.DataFrame(index=pd.to_datetime(chart_history.index))
+    chart_data["Adjusted close"] = pd.to_numeric(chart_history["Close"], errors="coerce")
+    chart_data["50-day SMA"] = chart_data["Adjusted close"].rolling(50, min_periods=50).mean()
+    chart_data["200-day SMA"] = chart_data["Adjusted close"].rolling(200, min_periods=200).mean()
+    chart_data = chart_data.replace([np.inf, -np.inf], np.nan).dropna(subset=["Adjusted close"])
+    # A one-year selection should not display dates beyond its actual retrieved data.
+    if not chart_data.empty:
+        chart_data = chart_data.loc[chart_data.index <= chart_data.index.max()]
+    st.line_chart(chart_data, x_label="Date", y_label="Price", height=380)
     tech_rows = [
         {"Indicator": "50-day SMA", "Value": metrics.get("sma50")},
         {"Indicator": "200-day SMA", "Value": metrics.get("sma200")},
@@ -547,15 +522,29 @@ if result:
         st.success("Live headlines retrieved. Headlines are evidence to inspect, not proof of causal market impact.")
         titles = [a.get("article_title", "") for a in report["routed_articles"] if a.get("article_title")]
         if titles:
-            synthesis = synthesize_news(result["report"].get("raw_articles", []))
             st.write(f"Retrieved **{len(titles)}** article(s). The list below is a source-level summary; the app does not claim a quantified sentiment trend unless an analysis model is configured.")
+            def headline_theme(title: str) -> str:
+                text = title.lower()
+                rules = [
+                    ("Products, AI and strategy", ("iphone", "product", "ai", "artificial intelligence", "chip", "strategy", "launch")),
+                    ("Analyst views and valuation", ("analyst", "price target", "valuation", "buy right now", "defensive play", "worth in", "stock to buy")),
+                    ("Institutional ownership and trading", ("stake", "purchased by", "raises stake", "institutional", "shares", "trading lower", "market cap", "market value")),
+                    ("Earnings and financial performance", ("earnings", "revenue", "profit", "quarter", "results", "guidance")),
+                ]
+                for label, keywords in rules:
+                    if any(keyword in text for keyword in keywords):
+                        return label
+                return "Other company or market news"
+            theme_groups: dict[str, list[str]] = {}
+            for title in titles:
+                theme_groups.setdefault(headline_theme(title), []).append(title)
             st.markdown("### Rule-based headline themes")
-            if synthesis["groups"]:
-                for theme, theme_titles in synthesis["groups"].items():
-                    with st.expander(f"{theme} · {len(theme_titles)} headline(s)"):
-                        for headline in theme_titles:
-                            st.write(f"- {headline}")
-            st.caption(synthesis["method"] + " Theme labels are approximate and can overlap conceptually.")
+            for theme, theme_titles in sorted(theme_groups.items(), key=lambda item: (-len(item[1]), item[0])):
+                st.write(f"**{theme}** · {len(theme_titles)} headline(s)")
+                with st.expander(f"View {theme.lower()} headlines"):
+                    for title in theme_titles:
+                        st.write(f"- {title}")
+            st.caption("Keyword-based headline grouping only. Categories are approximate and do not measure sentiment or prove causal market impact.")
             for article in report["routed_articles"]:
                 with st.expander(f"{article['specialist']} · {article['article_title']}"):
                     st.caption(f"Category: {article['category']}")
