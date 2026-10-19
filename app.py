@@ -414,52 +414,108 @@ for key in ["report_error", "optimizer_error"]:
         st.caption(r[key])
 
 st.markdown("---")
-tab_overview, tab_plan, tab_news, tab_memory = st.tabs(
-    ["Market & fundamentals", "Plan & routing", "News prompt chain", "Memory"]
+st.header("1. Market Analysis")
+st.markdown("### Historical price and moving averages")
+st.line_chart(r["chart"])
+st.caption("Historical observations only; moving averages are not forecasts.")
+st.markdown("### Market metrics")
+st.dataframe(pd.DataFrame([r["market"]]), use_container_width=True)
+
+st.markdown("---")
+st.header("2. Company Fundamentals")
+st.dataframe(pd.DataFrame([r["fundamentals"]]), use_container_width=True)
+
+st.markdown("---")
+st.header("3. Research Plan and Agent Routing")
+st.markdown("### Research plan")
+st.write("Planning method:", r["plan"].get("planning_method"))
+st.write(r["plan"].get("rationale", ""))
+st.write("Prior learning:", r["plan"].get("prior_learning_applied", ""))
+st.dataframe(pd.DataFrame(r["plan"].get("tasks", [])), use_container_width=True)
+st.markdown("### Specialist routing")
+if not r["articles"].empty:
+    st.dataframe(r["articles"][["title", "category", "routed_to"]], use_container_width=True)
+    st.bar_chart(r["articles"]["routed_to"].value_counts())
+else:
+    st.info("No articles were retrieved; routing was not run.")
+
+st.markdown("---")
+st.header("4. News Prompt Chain")
+st.write("Prompt-chain status:", r["chain_status"])
+st.markdown("### News summary")
+st.write(r["news_summary"])
+if r["news_error"]:
+    st.warning("News retrieval issue: " + r["news_error"])
+if not r["articles"].empty:
+    st.markdown("### Retrieved articles and source metadata")
+    st.dataframe(
+        r["articles"][["title", "publisher", "published", "link", "category", "topics", "routed_to"]],
+        use_container_width=True,
+    )
+else:
+    st.info("No news articles were available for this run.")
+
+st.markdown("---")
+st.header("5. Final Optimized Financial Research Report")
+st.markdown(r["report"])
+st.download_button(
+    "Download full report as Markdown",
+    data=r["report"],
+    file_name=f"{r['ticker']}_financial_research_report.md",
+    mime="text/markdown",
+    key="download_full_report",
 )
 
-with tab_overview:
-    st.markdown("### Historical price and moving averages")
-    st.line_chart(r["chart"])
-    st.caption("Historical observations only; moving averages are not forecasts.")
-    st.markdown("### Company fundamentals")
-    st.dataframe(pd.DataFrame([r["fundamentals"]]), use_container_width=True)
-    st.markdown("### Market metrics")
-    st.dataframe(pd.DataFrame([r["market"]]), use_container_width=True)
+st.markdown("---")
+st.header("6. Evaluator–Optimizer Results")
+eval_col1, eval_col2 = st.columns([1, 2])
+with eval_col1:
+    st.metric("Completeness score", f"{r['evaluation']['score']:.1f}%")
+    st.caption("Completeness only—not factual accuracy or investment performance.")
+with eval_col2:
+    st.dataframe(pd.DataFrame([
+        {"Check": k, "Passed": bool(v)} for k, v in r["evaluation"]["checks"].items()
+    ]), use_container_width=True)
+st.markdown("### Evaluator feedback")
+if r["critique"]:
+    for item in r["critique"]:
+        st.write("- " + item)
+else:
+    st.success("All configured completeness checks passed.")
+st.write("Initial report evaluation:", f"{r['initial_evaluation']['score']:.1f}%")
+st.write("Final report generation method:", r["report_method"])
+for key in ["report_error", "optimizer_error"]:
+    if r.get(key):
+        st.caption(r[key])
 
-with tab_plan:
-    st.markdown("### Research plan")
-    st.write("Planning method:", r["plan"].get("planning_method"))
-    st.write(r["plan"].get("rationale", ""))
-    st.write("Prior learning:", r["plan"].get("prior_learning_applied", ""))
-    st.dataframe(pd.DataFrame(r["plan"].get("tasks", [])), use_container_width=True)
-    st.markdown("### Specialist routing")
-    if not r["articles"].empty:
-        st.dataframe(r["articles"][["title", "category", "routed_to"]], use_container_width=True)
-        st.bar_chart(r["articles"]["routed_to"].value_counts())
-    else:
-        st.info("No articles were retrieved; routing was not run.")
+st.markdown("---")
+st.header("7. Research Memory")
+st.write("Memory file:", str(MEMORY_FILE))
+st.write("Memory records currently readable:", len(load_memory()))
+st.write(
+    "Latest record saved:",
+    "Yes" if st.session_state.get("memory_saved")
+    else "No / hosting filesystem may be ephemeral.",
+)
+st.caption(
+    "Streamlit Community Cloud storage may be ephemeral. Use external persistent "
+    "storage if durable memory across redeployments is required."
+)
+memory = load_memory()
+if memory:
+    st.dataframe(pd.DataFrame(memory[::-1]), use_container_width=True)
+else:
+    st.info("No memory records have been saved yet.")
 
-with tab_news:
-    st.write("Prompt-chain status:", r["chain_status"])
-    st.markdown("### News summary")
-    st.write(r["news_summary"])
-    if r["news_error"]:
-        st.warning("News retrieval issue: " + r["news_error"])
-    if not r["articles"].empty:
-        st.markdown("### Retrieved articles and source metadata")
-        st.dataframe(r["articles"][["title", "publisher", "published", "link", "category", "topics", "routed_to"]], use_container_width=True)
-    else:
-        st.info("No news articles were available for this run.")
-
-with tab_memory:
-    st.markdown("### Saved research memory")
-    st.write("Current memory file:", str(MEMORY_FILE))
-    st.write("Memory records currently readable:", len(load_memory()))
-    st.write("Latest record saved:", "Yes" if st.session_state.get("memory_saved") else "No / hosting filesystem may be ephemeral.")
-    st.caption("Streamlit Community Cloud storage may be ephemeral. Use external persistent storage if durable memory across redeployments is required.")
-    memory = load_memory()
-    if memory:
-        st.dataframe(pd.DataFrame(memory[::-1]), use_container_width=True)
-    else:
-        st.info("No memory records have been saved yet.")
+st.markdown("---")
+st.header("8. Limitations and Responsible Use")
+st.markdown(
+    "- Market and fundamental data are supplied by Yahoo Finance and may be delayed, "
+    "incomplete, or unavailable.\n"
+    "- News processing uses retrieved headlines and metadata; headlines do not prove "
+    "the full facts of a story. Verify material claims with original sources.\n"
+    "- Keyword-based specialist routing is a fallback and may misclassify articles.\n"
+    "- The evaluation score measures report completeness, not factual accuracy or "
+    "investment performance.\n"
+    "- This is an educational research prototype, not personalized investment advice."
+)
