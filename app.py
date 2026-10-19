@@ -381,8 +381,41 @@ m3.metric("20-day trend", r["market"]["trend_signal"])
 vol = r["market"].get("annualized_volatility_pct")
 m4.metric("Annualized volatility", f"{vol:.2f}%" if vol is not None else "N/A")
 
-tab_overview, tab_plan, tab_news, tab_report, tab_memory = st.tabs(
-    ["Market & fundamentals", "Plan & routing", "News prompt chain", "Final report & evaluation", "Memory"]
+# Display the full report directly on the main page rather than hiding it in a tab.
+st.markdown("---")
+st.header("Full Financial Research Report")
+st.markdown(r["report"])
+st.download_button(
+    "Download full report as Markdown",
+    data=r["report"],
+    file_name=f"{r['ticker']}_financial_research_report.md",
+    mime="text/markdown",
+    key="download_full_report",
+)
+
+st.markdown("### Evaluation summary")
+eval_col1, eval_col2 = st.columns([1, 2])
+with eval_col1:
+    st.metric("Completeness score", f"{r['evaluation']['score']:.1f}%")
+    st.caption("Completeness only—not factual accuracy or investment performance.")
+with eval_col2:
+    st.dataframe(pd.DataFrame([
+        {"Check": k, "Passed": bool(v)} for k, v in r["evaluation"]["checks"].items()
+    ]), use_container_width=True)
+if r["critique"]:
+    st.markdown("**Evaluator feedback**")
+    for item in r["critique"]:
+        st.write("- " + item)
+else:
+    st.success("All configured completeness checks passed.")
+st.caption("Report generation: " + str(r["report_method"]))
+for key in ["report_error", "optimizer_error"]:
+    if r.get(key):
+        st.caption(r[key])
+
+st.markdown("---")
+tab_overview, tab_plan, tab_news, tab_memory = st.tabs(
+    ["Market & fundamentals", "Plan & routing", "News prompt chain", "Memory"]
 )
 
 with tab_overview:
@@ -418,31 +451,6 @@ with tab_news:
         st.dataframe(r["articles"][["title", "publisher", "published", "link", "category", "topics", "routed_to"]], use_container_width=True)
     else:
         st.info("No news articles were available for this run.")
-
-with tab_report:
-    st.markdown(r["report"])
-    st.download_button(
-        "Download report as Markdown",
-        data=r["report"],
-        file_name=f"{r['ticker']}_financial_research_report.md",
-        mime="text/markdown",
-    )
-    st.markdown("### Deterministic completeness evaluation")
-    st.metric("Completeness score", f"{r['evaluation']['score']:.1f}%")
-    st.dataframe(pd.DataFrame([
-        {"Check": k, "Passed": bool(v)} for k, v in r["evaluation"]["checks"].items()
-    ]), use_container_width=True)
-    st.caption("Completeness score is not a measure of factual accuracy or investment performance.")
-    if r["critique"]:
-        st.markdown("### Evaluator feedback")
-        for item in r["critique"]:
-            st.write("- " + item)
-    else:
-        st.success("All configured completeness checks passed.")
-    st.write("Report generation:", r["report_method"])
-    for key in ["report_error", "optimizer_error"]:
-        if r.get(key):
-            st.caption(r[key])
 
 with tab_memory:
     st.markdown("### Saved research memory")
